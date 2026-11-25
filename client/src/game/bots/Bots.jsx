@@ -28,8 +28,7 @@ import { doorLanes } from '../track/doorState'
  * across the road (over the edge if hard enough), a real ram throws it (botBumped) -
  * it flies, lands back on the road if it comes down on it, else falls and reappears at
  * its checkpoint. In the lobby and on checkpoint plazas (shared/safeZones.js) they're
- * ghosts. How many depends on the quality preset, less one per other player in the
- * room.
+ * ghosts. How many depends on the quality preset. Only offline: an online room has none.
  */
 
 const NAMES = ['Barnacle', 'Captain Cog', 'Dockside Dee', 'Rusty Hull', 'Skipper', 'Tidewater', 'Bilge', 'Marlin']
@@ -150,11 +149,11 @@ function setBotActive(b, scene, on) {
 export default function Bots({ stage }) {
   const scene = useThree((s) => s.scene)
   const count = useQuality((s) => s.settings.bots)
-  // CPU racers fill the race when you're alone: each other player in the room takes
-  // one's place, so a full room has none (and no extra cars to draw).
-  const others = useGame((s) => (s.net.mode === 'online' ? Math.max(0, s.net.players - 1) : 0))
+  // CPU racers only fill the race when you play without a server (offline): online - connected or
+  // still connecting - the room is real players only.
+  const offline = useGame((s) => s.net.mode === 'offline')
   // A map without CPU racers (`bots: false` in its registry entry: Heat Run's police replace them).
-  const active = stageInfo(stage.id)?.bots === false ? 0 : Math.max(0, count - others)
+  const active = !offline || stageInfo(stage.id)?.bots === false ? 0 : count
 
   // Bodies are made in a private staging world (render must not touch the real physics:
   // React may render twice and keep one result, and the other copy's bodies would stay in
