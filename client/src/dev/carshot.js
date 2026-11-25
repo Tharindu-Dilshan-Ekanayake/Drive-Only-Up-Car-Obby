@@ -21,7 +21,7 @@ import { CALIPER_GEOMETRY, getCarModel, WHEEL_GEOMETRY } from '../game/cars/carM
 /**
  * Car Shot (dev only, /carshot.html): one car, or one of its wheels, from the side - orthographic,
  * on a transparent background, in the golden hour's light (warm low sun, apricot sky reflections).
- * scripts/make-loading-cars.mjs saves the pictures the loading screen drives across its pier.
+ * The pictures the loading screen drives across its pier (public/loading/) were saved from it.
  *
  *   ?id=<car>&part=body   the body with its brake callipers, a dark well behind each wheel
  *   ?id=<car>&part=wheel  one wheel (tyre and rim) - the loading screen spins it
