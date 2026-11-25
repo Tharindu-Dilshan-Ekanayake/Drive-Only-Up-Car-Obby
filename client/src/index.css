@@ -1235,11 +1235,14 @@ html[data-ads='1'] {
     --ad-b: 132px;
   }
 }
-/* Landscape phones: a shorter banner, and a box on the right edge. */
+/* Landscape phones: a shorter banner, and a box on the right edge. The same strip is kept on
+   the left too, so the panel stays in the middle of the screen (the phone's panels are narrow
+   enough to fit between the two). */
 @media (orientation: landscape) and (max-height: 520px) {
   html[data-ads='1'] {
     --ad-b: 66px;
     --ad-r: 190px;
+    --ad-l: 190px;
   }
 }
 /* Big screens: a box either side (300px wide), leaving a band in the middle. */
