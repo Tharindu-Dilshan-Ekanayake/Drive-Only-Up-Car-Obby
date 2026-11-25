@@ -3,17 +3,17 @@ canDie: false
 hasScore: true
 ---
 
-# +1 Arm Length: Boxity integration
+# Drive Only Up Car Obby (Up We Drive): Boxity integration
 
-The player cannot die: there is no death or game-over screen. You do rubber-arm pull-ups
-for Power, grab the two launch posts on the Launch Pad, walk back with your own controls
-while your arms stretch like rubber, and let go to fly down the rainbow runway: more Power
-flies you further, and the stretch meter (let go at the top of the twang for PERFECT) adds
-up to x1.6 Wins. You always get another launch. Your arms (24 kinds, bought with Wins)
-change how your Bloxity avatar's arms look and how much Power each gain is worth.
+A car obby: drive up long roads through checkpoints, dodging hammers, drones, sliding
+containers, rolling buoys and more. Three maps: Sky Docks (30 checkpoints; finishing it opens
+the next chapter), the Grand Tour (neon city, snow, tropics and canyon in one long road) and
+Heat Run (a police chase). The player cannot die: falling or leaving the road respawns you at
+your last checkpoint, and there is no game-over screen. Coins come from track coins,
+checkpoints, the summit and tricks; they buy car spins (44 cars, Common to Mythic), paints
+and item slots. Sky Pearls hidden on every road are a second, spendable currency.
 
-Built on the +1 Tire Rolling template: inside the code the old names stay (`health` is
-Power, a `tire` is a pair of arms, a `pad` is a pull-up bar, a `roll` is a launch).
+Hosting: see docs/HOSTING.md (game id `drive-only-up-car-obby`).
 
 ## Leaderboards
 
@@ -22,25 +22,27 @@ Scores are reported by the **game server**, never by the client
 player leaves, each pod sends the changed scores of its verified players to
 `POST {api}/v1/leaderboards/hosted/{BLOXITY_GAME_ID}/report` as `legion_<userId>`.
 
-| Board      | Label            | Score                                | Format  |
-|------------|------------------|--------------------------------------|---------|
-| `rebirths` | Rebirths         | `profile.rebirths`                   | number  |
-| `wins`     | Total Wins       | `profile.stats.totalWins`            | compact |
-| `distance` | Longest Flight (m) | `floor(profile.stats.bestDistance)`  | compact |
-| `playtime` | Minutes Played   | `floor(profile.stats.playtime / 60)` | number  |
+| Board      | Label                | Score                                  | Format  |
+|------------|----------------------|----------------------------------------|---------|
+| `altitude` | Highest Altitude (m) | `floor(profile.best.altitude)`         | number  |
+| `coins`    | Coins Collected      | `profile.stats.totalCoins`             | compact |
+| `finishes` | Summits Reached      | `profile.stats.finishes`               | number  |
+| `playtime` | Minutes Played       | `floor(profile.stats.playtime / 60)`   | number  |
 
 All four are `order: desc`, `mode: best`, `reset: none`.
 
-## Gems purchases
+## Gems
 
-Boxity's purchase webhook goes to `POST /api/gems/webhook` on the game server. It is
-recorded in the database by `transactionId` (idempotent) and applied exactly once by
-the pod the buyer plays on. Unknown skus are answered 400 so Boxity refunds them.
+The game no longer sells anything for Boxity Gems: the store's coin packs and item slot
+cost Sky Pearls, paid in-game (`shared/balance.js` PRODUCTS, `kind: 'pearls'`). Don't
+configure Gems products for this game on the platform. If one is configured anyway,
+`POST /api/gems/webhook` still exists but only answers 410, so Boxity refunds the buyer.
 
 ## Rewarded ads
 
-The client sends `adReward { placement, rewardToken }`; the server verifies the token
-with `POST {api}/v1/ads/reward/verify` before granting anything.
+Placement `free-spin` gives one free car spin, at most once every 5 minutes. The client
+sends `adReward { placement, rewardToken }`; the server verifies the token with
+`POST {api}/v1/ads/reward/verify` before granting anything.
 
 ## Open Rooms
 
@@ -49,23 +51,12 @@ Each pod reports its rooms every 2 s to `POST {MATCHMAKER_REPORT_URL}/{BLOXITY_G
 "Open Rooms" on the game page. The client joins `?roomId=` at launch and falls back to
 normal matchmaking if that room is gone or full.
 
-## Avatars
-
-`client/src/game/PlayerAvatar.jsx` + `avatarRig.js` draw every slot: skin (with face,
-shirt and pants), body parts, hat + hair + mask on `Neck1`, back on `Spine2`, neck/chest
-on `Spine2` and waist on `Spine1` (rest-inverse placement), hands and shoes as mirrored
-pairs following the leaf bones' position and rotation only. A player wearing an uploaded
-character (`characterId`) gets its GLB via `avatar.getCharacter()` / `getCharacterFor()`,
-with accessories fitted by `characterAccessoryMatrix`; on any failure the regular avatar
-shows. Body proportions are applied by moving bones, so accessories follow them.
-
 ## Server environment
 
 | Variable                | Purpose                                                       |
 |-------------------------|---------------------------------------------------------------|
 | `BLOXITY_REPORT_TOKEN`  | Token for leaderboard and room reports (none set = no reports) |
 | `MATCHMAKER_REPORT_URL` | Where the Open Rooms reporter posts (injected by Boxity hosting) |
-| `BLOXITY_GAME_ID`       | Hosted game id for reports (default `1-arm-length`)              |
-| `LEGION_WEBHOOK_SECRET` | Must match the webhook's `x-legion-webhook-secret` header     |
-| `MONGODB_URI`           | Shared database for profiles and Gems grants (SQLite without) |
+| `BLOXITY_GAME_ID`       | Hosted game id for reports (default `drive-only-up-car-obby`)             |
+| `MONGODB_URI`           | Shared database for profiles (SQLite without)                  |
 | `BLOXITY_API_URL` etc.  | Platform URLs; production defaults (`server/src/bloxityEnv.js`) |

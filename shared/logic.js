@@ -1,851 +1,524 @@
-import {
-  AD_REWARDS,
-  BADGES,
-  DAILY_INTERVAL_MS,
-  dayNumber,
-  DAILY_REWARDS,
-  EGGS,
-  FREE_REWARD,
-  GEM_PRODUCTS,
-  HEALTH_PACKS,
-  healthForLevel,
-  hitGrade,
-  hitReach,
-  ITEMS,
-  levelCap,
-  MAX_EQUIPPED_PETS,
-  MAX_PET_INVENTORY,
-  OFFLINE_MAX_MS,
-  OFFLINE_MIN_MS,
-  OFFLINE_RATE,
-  PADS,
-  PETS,
-  PLAYTIME_REWARDS,
-  RARITIES,
-  REBIRTH_SKIP_ROLLS,
-  rebirthGift,
-  rebirthMultiplier,
-  ROLL_BASE,
-  ROLL_H0,
-  ROLL_RECOVERY,
-  SECRET_STAR,
-  rollDuration,
-  SHOP,
-  streakMultiplier,
-  STRETCH_REACH,
-  STRETCH_WINS,
-  TIRES,
-  TRAIN_INTERVAL,
-  TROPHY_FIRST,
-  TROPHY_METERS,
-  TROPHY_SPACING,
-  TUTORIAL,
-  WALL_MARGIN,
-  WORLD_PORTALS,
-  WORLD_ZONES,
-  ZONES,
-  zonesOf,
-} from './balance.js'
-
 /**
- * Game rules as pure functions over a plain profile object.
+ * Up We Drive's rules as pure functions over a profile: creating and repairing saves,
+ * checkpoints, coins, tricks, car spins, slots and store grants. No I/O, no clocks of
+ * their own (callers pass `now` and `rand`), so the server, the offline stand-in and
+ * the tests all run exactly the same code.
  *
- * The server runs these authoritatively; the client runs the very same functions for
- * offline play and for display (costs, multipliers, what a button would do). Mutating
- * functions change the profile in place and return a small result describing what
- * happened, which is what gets sent to the client as an event.
- *
- * `session` is the per-connection state that is never saved: when this session
- * started, which playtime rewards were claimed, the free-reward flag.
+ * Functions that can fail return `{ ok: false, error }` with a message fit to show the
+ * player; successful ones return `{ ok: true, ... }` and change the profile in place.
  */
 
-export const PROFILE_VERSION = 1
+import {
+  AD_REWARDS,
+  CHECKPOINT_COINS,
+  COIN_VALUE,
+  DUPLICATE_REFUND,
+  FINISH_BONUS,
+  MAX_SLOTS,
+  MAX_TRICK_SCORE,
+  MIN_FINISH_MS,
+  PITY_SPINS,
+  PRODUCT_BY_ID,
+  SLOT_COSTS,
+  SPIN_COST,
+  TRICK_POINTS_PER_COIN,
+  CHEST_COINS,
+  PEARL_COINS,
+  PEARL_SET_BONUS,
+} from './balance.js'
+import { CAR_BY_ID, CARS, RARITIES, RARITY_INFO, STARTER_CAR } from './cars.js'
+import { COSMETIC_KINDS, DEFAULT_NITRO, DEFAULT_PAINT } from './cosmetics.js'
+import { DEFAULT_STAGE, STAGE_IDS, STAGES, stageInfo } from './stages/index.js'
 
-export function createProfile(id, name) {
+/**
+ * Still 2: per-map progress (`maps`) came in without a version bump. A save without
+ * `maps` (or a newer save read by an older server, which ignores `maps`) keeps working:
+ * the old top-level `checkpoint / best / splits / pearls` are Sky Docks progress, and
+ * every save written now carries them too (toSaveData).
+ */
+export const PROFILE_VERSION = 2
+
+/** A stage's last checkpoint index: reaching it is the finish. */
+export const lastCheckpoint = (stage) => stage.checkpoints.length - 1
+
+/**
+ * Bounds a save is repaired to before its map is known (normalizeProgress); fitProgress
+ * then trims to the actual stage. Sky Pearls are one bit per section (<= 31 roads).
+ */
+const MAX_CHECKPOINTS = 63
+const MAX_PEARL_BITS = 0x7fffffff
+
+const SETTINGS_DEFAULTS = { music: true, sfx: true, ghost: true, sunset: true }
+
+export function createProfile(id, name, now = Date.now()) {
   return {
-    v: PROFILE_VERSION,
-    id,
-    name,
-    health: 0,
-    wins: 0,
-    rebirths: 0,
-    level: 1,
-    equippedTire: 'bicycle',
-    ownedTires: ['bicycle'],
-    pets: [],
-    equippedPets: [],
-    nextPetUid: 1,
-    items: {},
-    boosts: { health: 0, wins: 0 },
-    passes: {},
-    daily: { start: 0, claimed: [] },
-    freeRewardClaimed: false,
-    tutorialStep: 0,
-    badges: [],
-    stats: {
-      rolls: 0,
-      trains: 0,
-      bestDistance: 0,
-      playtime: 0,
-      bestHealth: 0,
-      totalWins: 0,
-      wallsBroken: 0,
-      /** Furthest zone ever reached (index into ZONES): its `discover` prize is paid once. */
-      bestZone: 0,
-      /** The same for World 2's stages. */
-      bestZone2: 0,
-    },
-    /** The world you're in (index into WORLDS), and whether World 2's portal is open. */
-    world: 0,
-    world2Unlocked: false,
-    /** Secret Stars found, by world id ('world2': Palm Beach's). */
-    secretStars: {},
-    lastPad: -1,
-    lastSeen: 0,
-    settings: { autoRebirth: false, autoRoll: false },
-    /** Today's quests (engage.js): the day they're for, the three, the bonus chest taken. */
-    quests: { day: -1, list: [], bonus: false },
-    /** Login streak: the last day played (balance.dayNumber), days in a row, the best run. */
-    streak: { day: -1, days: 0, best: 0 },
+    id: String(id),
+    name: String(name || 'Player'),
+    version: PROFILE_VERSION,
+    coins: 0,
+    cars: [STARTER_CAR],
+    car: STARTER_CAR,
+    slots: 1,
+    /** Spendable Sky Pearls: +1 per pearl found the first time, spent in the store (buyProduct). */
+    pearlBank: 0,
+    /** Store cosmetics: owned paints / nitro colours and the equipped ones (shared/cosmetics.js). */
+    paints: [DEFAULT_PAINT],
+    paint: DEFAULT_PAINT,
+    nitros: [DEFAULT_NITRO],
+    nitro: DEFAULT_NITRO,
+    /** Progress per map: stage id -> emptyProgress(), made on first visit (progressFor). */
+    maps: {},
+    /** Locked maps (chapters) opened for good: stage ids (isStageUnlocked). */
+    unlocks: [],
+    stats: { totalCoins: 0, finishes: 0, tricks: 0, spins: 0, falls: 0, playtime: 0 },
+    pity: 0,
+    settings: { ...SETTINGS_DEFAULTS },
+    createdAt: now,
+    lastSeen: now,
   }
 }
 
-/** Fills in anything missing from an older or partial save. Never throws. */
-export function normalizeProfile(raw, id, name) {
-  const base = createProfile(id, name)
-  if (!raw || typeof raw !== 'object') return base
-  const p = { ...base, ...raw, id, name: name || raw.name || base.name }
-  p.boosts = { ...base.boosts, ...(raw.boosts || {}) }
-  p.stats = { ...base.stats, ...(raw.stats || {}) }
-  p.settings = { ...base.settings, ...(raw.settings || {}) }
-  p.daily = { ...base.daily, ...(raw.daily || {}) }
-  const streak = raw.streak && typeof raw.streak === 'object' ? raw.streak : {}
-  p.streak = {
-    day: Number.isInteger(streak.day) ? streak.day : -1,
-    days: Math.max(0, Math.floor(streak.days) || 0),
-    best: Math.max(0, Math.floor(streak.best) || 0),
+const wholeAtLeast0 = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0)
+const at0 = (v) => (Number.isFinite(v) && v > 0 ? v : 0)
+const clampInt = (v, lo, hi, fallback) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.floor(v))) : fallback)
+
+// --- Progress per map ------------------------------------------------------------------
+
+/**
+ * One map's progress: the run's `checkpoint` (0 = not started / back in the lobby), your
+ * `best` there, best `splits` per checkpoint (ms) and the Sky Pearls found (a bit per
+ * section, shared/adventure.js).
+ */
+export const emptyProgress = () => ({ checkpoint: 0, best: { checkpoint: 0, altitude: 0, finishMs: 0 }, splits: {}, pearls: 0 })
+
+/** How many Sky Pearls a pearl bitmask holds (every bit is one pearl). */
+function popcount(bits) {
+  let n = 0
+  for (let m = bits; m; m &= m - 1) n += 1
+  return n
+}
+
+/** Every Sky Pearl `profile` has found, on all maps (its bank can never hold more). */
+export const foundPearls = (profile) => Object.values(profile?.maps || {}).reduce((sum, p) => sum + popcount((p?.pearls || 0) & MAX_PEARL_BITS), 0)
+
+/** Read-only stand-in for a map not visited yet (never mutate it). */
+export const NO_PROGRESS = Object.freeze({
+  checkpoint: 0,
+  best: Object.freeze({ checkpoint: 0, altitude: 0, finishMs: 0 }),
+  splits: Object.freeze({}),
+  pearls: 0,
+})
+
+/** Map `stageId`'s progress in `profile`, or NO_PROGRESS (for reading: the UI). */
+export const progressOf = (profile, stageId) => profile?.maps?.[stageId] || NO_PROGRESS
+
+/** A progress record from whatever was stored, repaired to generic bounds. */
+function normalizeProgress(raw) {
+  const p = emptyProgress()
+  if (!raw || typeof raw !== 'object') return p
+  p.checkpoint = clampInt(raw.checkpoint, 0, MAX_CHECKPOINTS, 0)
+  const best = raw.best && typeof raw.best === 'object' ? raw.best : {}
+  p.best = {
+    checkpoint: clampInt(best.checkpoint, 0, MAX_CHECKPOINTS, 0),
+    altitude: at0(best.altitude),
+    finishMs: wholeAtLeast0(best.finishMs),
   }
-  const quests = raw.quests && typeof raw.quests === 'object' ? raw.quests : {}
-  p.quests = {
-    day: Number.isInteger(quests.day) ? quests.day : -1,
-    list: Array.isArray(quests.list)
-      ? quests.list
-          .filter((q) => q && typeof q.type === 'string' && Number.isFinite(q.target))
-          .map((q) => ({ type: q.type, tier: Math.max(0, Math.min(2, Math.floor(q.tier) || 0)), target: q.target, progress: Math.max(0, Number(q.progress) || 0), claimed: q.claimed === true }))
-      : [],
-    bonus: quests.bonus === true,
+  if (raw.splits && typeof raw.splits === 'object') {
+    for (const [key, ms] of Object.entries(raw.splits)) {
+      const index = Number(key)
+      if (Number.isInteger(index) && index >= 1 && index <= MAX_CHECKPOINTS && Number.isFinite(ms) && ms > 0) p.splits[index] = Math.round(ms)
+    }
   }
-  p.items = Object.fromEntries(Object.entries(raw.items || {}).filter(([itemId]) => ITEMS[itemId]))
-  p.passes = Object.fromEntries(Object.entries(raw.passes || {}).filter(([productId]) => SHOP[productId]))
-  p.health = Number.isFinite(raw.health) ? Math.max(0, raw.health) : 0
-  p.wins = Number.isFinite(raw.wins) ? Math.max(0, raw.wins) : 0
-  p.pets = Array.isArray(raw.pets) ? raw.pets.filter((pet) => PETS[pet?.id]) : []
-  p.equippedPets = Array.isArray(raw.equippedPets)
-    ? raw.equippedPets.filter((uid) => p.pets.some((pet) => pet.uid === uid)).slice(0, MAX_EQUIPPED_PETS)
-    : []
-  const owned = Array.isArray(raw.ownedTires) ? raw.ownedTires.filter((tireId) => tireIndex(tireId) >= 0) : []
-  p.ownedTires = owned.length ? owned : ['bicycle']
-  if (!p.ownedTires.includes(p.equippedTire)) p.equippedTire = p.ownedTires[0]
-  p.stats.bestZone = Math.min(ZONES.length - 1, Math.max(0, Math.floor(p.stats.bestZone) || 0))
-  p.stats.bestZone2 = Math.min(ZONES.length - 1, Math.max(0, Math.floor(p.stats.bestZone2) || 0))
-  p.world2Unlocked = raw.world2Unlocked === true
-  p.secretStars = { world2: raw.secretStars?.world2 === true }
-  p.world = p.world2Unlocked && raw.world === 1 ? 1 : 0
-  // Levels follow from Health; recompute rather than trust a stored one.
-  p.level = levelFor(p.health, p.rebirths)
-  // The tutorial is for brand-new players only: anyone who has rebirthed is past it.
-  if (p.rebirths > 0) p.tutorialStep = TUTORIAL.length
-  p.tutorialStep = Math.min(TUTORIAL.length, Math.max(0, Math.floor(p.tutorialStep) || 0))
-  p.v = PROFILE_VERSION
+  p.pearls = clampInt(raw.pearls, 0, MAX_PEARL_BITS, 0) & MAX_PEARL_BITS
   return p
 }
 
-export function createSession(now) {
-  return { start: now, playtimeClaimed: [], freeRewardTaken: false, adAt: {} }
-}
-
-// --- Lookups ------------------------------------------------------------------------
-
-export const tireIndex = (id) => TIRES.findIndex((t) => t.id === id)
-export const tireById = (id) => TIRES.find((t) => t.id === id) || TIRES[0]
-
-export function isPadUnlocked(profile, index) {
-  const pad = PADS[index]
-  if (!pad) return false
-  // A world's own treadmill runs in that world only.
-  if (pad.world !== undefined && (profile.world || 0) !== pad.world) return false
-  if (pad.product) return Boolean(profile.passes[pad.product])
-  return profile.rebirths >= pad.rebirths
-}
+/** The old (pre-`maps`) top-level Sky Docks fields. */
+const LEGACY_KEYS = ['checkpoint', 'best', 'splits', 'pearls']
+const hasLegacyProgress = (raw) => LEGACY_KEYS.some((k) => raw[k] !== undefined)
 
 /**
- * Health values are kept to a tenth below a million and whole above, so repeated
- * small gains don't pile up float dust.
+ * Sky Docks progress from a save's `maps['sky-docks']` and its top-level fields. The
+ * top-level ones are the newer whenever they differ (an older server, which only knows
+ * those, played the save last), so the run's checkpoint comes from them; the bests are
+ * merged, so nothing is lost either way.
  */
-export const tidy = (value) => (value < 1e6 ? Math.round(value * 10) / 10 : Math.round(value))
-
-/** "Nice" price or amount: two significant figures (692 -> 690, 1934 -> 1900). */
-export function niceRound(n) {
-  if (n < 100) return Math.max(1, Math.round(n))
-  const step = 10 ** (Math.floor(Math.log10(n)) - 1)
-  return Math.round(n / step) * step
-}
-
-// --- Levels -------------------------------------------------------------------------
-
-/** The level `health` reaches, never above the cap for `rebirths`. */
-export function levelFor(health, rebirths) {
-  const cap = levelCap(rebirths)
-  let level = 1
-  while (level < cap && health >= healthForLevel(level + 1)) level += 1
-  return level
-}
-
-export const isMaxLevel = (profile) => profile.level >= levelCap(profile.rebirths)
-
-/** 0..1 through the current level: what the level bar fills to. */
-export function levelProgress(profile) {
-  if (isMaxLevel(profile)) return 1
-  const from = healthForLevel(profile.level)
-  const to = healthForLevel(profile.level + 1)
-  return Math.max(0, Math.min(1, (profile.health - from) / Math.max(1e-9, to - from)))
-}
-
-/** 0..1 progress towards being able to rebirth, by levels. */
-export function rebirthProgress(profile) {
-  const cap = levelCap(profile.rebirths)
-  if (profile.level >= cap) return 1
-  return Math.max(0, Math.min(1, (profile.level - 1 + levelProgress(profile)) / Math.max(1, cap - 1)))
-}
-
-// --- Multipliers --------------------------------------------------------------------
-
-/** Equipped pets stack additively: x3 and x2 together make x4, not x6. */
-export function petMultiplier(profile) {
-  let total = 1
-  for (const uid of profile.equippedPets) {
-    const pet = profile.pets.find((p) => p.uid === uid)
-    if (pet && PETS[pet.id]) total += PETS[pet.id].mult - 1
+function mergeProgress(mapped, legacy) {
+  if (!mapped) return legacy
+  const out = emptyProgress()
+  out.checkpoint = legacy.checkpoint
+  out.best.checkpoint = Math.max(mapped.best.checkpoint, legacy.best.checkpoint)
+  out.best.altitude = Math.max(mapped.best.altitude, legacy.best.altitude)
+  const times = [mapped.best.finishMs, legacy.best.finishMs].filter((t) => t > 0)
+  out.best.finishMs = times.length ? Math.min(...times) : 0
+  for (const src of [mapped.splits, legacy.splits]) {
+    for (const [cp, ms] of Object.entries(src)) if (!out.splits[cp] || ms < out.splits[cp]) out.splits[cp] = ms
   }
-  return total
-}
-
-export const isBoostActive = (profile, kind, now) => (profile.boosts[kind] || 0) > now
-
-/** The x2 Health pass and potion; they stack. */
-export function healthBoostMultiplier(profile, now) {
-  return (profile.passes.healthX2 ? 2 : 1) * (isBoostActive(profile, 'health', now) ? 2 : 1)
-}
-
-/**
- * Days in a row you've played, as of `now`: your streak while it's alive (played today
- * or yesterday), else 0. (engage.applyStreak counts the days.)
- */
-export function streakDays(profile, now) {
-  const s = profile.streak
-  if (!s || s.days <= 0) return 0
-  return dayNumber(now) - s.day <= 1 ? s.days : 0
-}
-
-/** The x2 Wins pass and potion (they stack), and your login streak's bonus. */
-export function winsMultiplier(profile, now) {
-  return (profile.passes.winsX2 ? 2 : 1) * (isBoostActive(profile, 'wins', now) ? 2 : 1) * streakMultiplier(streakDays(profile, now))
-}
-
-/** Palm Beach's Secret Star, once found: x2 Power for good, in every world. */
-export const starMultiplier = (profile) => (profile.secretStars?.world2 ? SECRET_STAR.power : 1)
-
-/** Everything that multiplies a Health gain except the tire and where you earn it. */
-export function gainMultiplier(profile, now) {
-  return rebirthMultiplier(profile.rebirths) * petMultiplier(profile) * healthBoostMultiplier(profile, now) * starMultiplier(profile)
-}
-
-/** Health from one gain anywhere but a pad: your tire's power, multiplied. */
-export const baseGain = (profile, now) => tidy(tireById(profile.equippedTire).power * gainMultiplier(profile, now))
-
-/** Health from one training step on pad `index`. */
-export function padGain(profile, index, now) {
-  const pad = PADS[index]
-  if (!pad) return 0
-  return tidy(tireById(profile.equippedTire).power * pad.mult * gainMultiplier(profile, now))
-}
-
-// --- Training, levels, rebirth ------------------------------------------------------
-
-/**
- * Banks a natural gain (pad, rolling or walking) and the levels it reaches. Once you're
- * at max level natural gains stop: rebirth to keep going. Returns what was really added.
- */
-function addHealth(profile, gain) {
-  const cap = levelCap(profile.rebirths)
-  if (profile.level >= cap) return { gain: 0, leveledUp: false, maxed: true }
-  // Stops exactly on max level rather than overshooting it.
-  const room = Math.max(0, healthForLevel(cap) - profile.health)
-  const added = tidy(Math.min(gain, room))
-  profile.health = tidy(profile.health + added)
-  profile.stats.trains += 1
-  profile.stats.bestHealth = Math.max(profile.stats.bestHealth, profile.health)
-  const before = profile.level
-  profile.level = levelFor(profile.health, profile.rebirths)
-  return { gain: added, leveledUp: profile.level > before, levels: profile.level - before, maxed: profile.level >= cap }
-}
-
-export function applyTrain(profile, index, now) {
-  if (!isPadUnlocked(profile, index)) return { ok: false, error: 'Bar locked' }
-  profile.lastPad = index
-  return { ok: true, ...addHealth(profile, padGain(profile, index, now)) }
-}
-
-/** One tick of Health while your tire rolls. */
-export function applyRollTick(profile, now) {
-  return { ok: true, ...addHealth(profile, baseGain(profile, now)) }
-}
-
-/** One step's worth of walking round the lobby: the same gain as a roll tick. */
-export const applyWalkStep = applyRollTick
-
-/** Rebirth: +1 rebirth; Health and levels reset (Wins, tires and pets stay). */
-export function applyRebirth(profile) {
-  if (!isMaxLevel(profile)) return { ok: false, error: `Reach level ${levelCap(profile.rebirths)} first!` }
-  profile.rebirths += 1
-  profile.tutorialStep = TUTORIAL.length
-  profile.health = 0
-  profile.level = 1
-  const gift = rebirthGift(profile.rebirths)
-  if (gift) addItem(profile, gift.item, gift.amount)
-  return { ok: true, rebirths: profile.rebirths, gift }
-}
-
-// --- Rolling ------------------------------------------------------------------------
-
-/** How far `health` rolls on open ground, before any wall gets in the way. */
-/** Health that just reaches each gate on open ground (its wall needs WALL_MARGIN times it). */
-const GATE_REACH = ZONES.map((z) => z.wall / WALL_MARGIN)
-
-/**
- * How far `health` rolls on open ground, before any wall gets in the way: up to the
- * first gate along a gentle curve from ROLL_BASE, then from each gate's mark to the next
- * as Health climbs from one gate's reach to the next (in log terms), and past the last
- * gate at the last stage's pace.
- */
-export function rollReach(health) {
-  const h = Math.max(0, health)
-  const first = GATE_REACH[1]
-  if (h <= first) return ROLL_BASE + ((ZONES[1].start - ROLL_BASE) * Math.log1p(h / ROLL_H0)) / Math.log1p(first / ROLL_H0)
-  let i = 1
-  while (i + 1 < ZONES.length && h >= GATE_REACH[i + 1]) i += 1
-  // Past the last gate, keep going at the last stage's pace.
-  const a = i + 1 < ZONES.length ? i : i - 1
-  const span = ZONES[a + 1].start - ZONES[a].start
-  return ZONES[i].start + (span * Math.log(h / GATE_REACH[i])) / Math.log(GATE_REACH[a + 1] / GATE_REACH[a])
-}
-
-export function zoneIndexAt(meter) {
-  for (let i = ZONES.length - 1; i >= 0; i -= 1) {
-    if (meter >= ZONES[i].start) return i
-  }
-  return 0
-}
-
-/**
- * Where a kick with `health` (Power) lands: its full reach - nothing on the field stops
- * it. `broken` is how many stages it flew into past the first (the name stayed from the
- * template's walls); `blocked` is always -1.
- */
-export function rollOutcome(health, reachFactor = 1) {
-  const reach = rollReach(health) * reachFactor
-  let broken = 0
-  for (let i = 1; i < ZONES.length && ZONES[i].start <= reach; i += 1) broken += 1
-  return { distance: reach, blocked: -1, broken, reach }
-}
-
-/** Yards of every trophy within `distance`. */
-export function trophiesWithin(distance) {
-  const out = []
-  for (let m = TROPHY_FIRST; m <= distance; m += TROPHY_SPACING) out.push(m)
+  out.pearls = mapped.pearls | legacy.pearls
   return out
 }
 
-/** Wins the trophy at `meter` is worth in `world`, before multipliers. */
-export const trophyValue = (meter, world = 0) => Math.max(1, Math.round(zonesOf(world)[zoneIndexAt(meter)].winsPerMeter * TROPHY_METERS))
-
-/**
- * Wins for a kick in `world` before multipliers: every yard flown, at its stage's rate
- * (further out pays more per yard), plus the trophies passed. (All worlds' stages start
- * at the same yards; only what they pay differs.)
- */
-export function baseRollWins(distance, world = 0) {
-  const zones = zonesOf(world)
-  let wins = 0
-  for (let i = 0; i < zones.length; i += 1) {
-    const start = zones[i].start
-    const end = i + 1 < zones.length ? zones[i + 1].start : Infinity
-    const metres = Math.max(0, Math.min(distance, end) - start)
-    wins += metres * zones[i].winsPerMeter
+/** Per-stage lookups (coins, pearls, chests by id; all its pearl bits), once per stage. */
+const lookups = new WeakMap()
+export function stageLookups(stage) {
+  let l = lookups.get(stage)
+  if (!l) {
+    l = {
+      coinById: new Map(stage.coins.map((c) => [c.id, c])),
+      pearlByIndex: new Map(stage.pearls.map((p) => [p.index, p])),
+      chestById: new Map(stage.chests.map((c) => [c.id, c])),
+      allPearls: stage.pearls.reduce((m, p) => m | (1 << p.index), 0),
+    }
+    lookups.set(stage, l)
   }
-  for (let m = TROPHY_FIRST; m <= distance; m += TROPHY_SPACING) wins += trophyValue(m, world)
-  return wins
+  return l
 }
 
-/** Wins a roll at `health` pays in `world` before multipliers. */
-export const rollWinsAt = (health, world = 0) => baseRollWins(rollOutcome(health).distance, world)
-
-/**
- * A kick down the field. Health is not consumed. Returns everything the client needs
- * to replay it locally: distance, duration, the wall that stopped it, the Wins earned
- * (trophy positions follow from the distance) and any zone reached for the first time.
- * `accuracy` is where the timing meter was stopped (0-1, see HIT_GRADES): its grade
- * decides how far the ball flies (hitReach: half as far for a WEAK kick, half as far
- * again for a PERFECT one) and multiplies the Wins (`bonus`). The Wins are what the
- * kick's Power is worth - the yards a plain kick would fly - times that bonus, never
- * the extra yards themselves: further out every yard pays more, so paying for them
- * would multiply a PERFECT kick's Wins dozens of times over late in the game. Without
- * the meter (Auto Kick) the kick is a plain x1 kick.
- */
-export function applyRoll(profile, now, accuracy = null, bonus = 1, stretch = 0) {
-  // `stretch` (0-1): how much of the 40 m stretch lane you'd walked back - further and richer.
-  const pulled = Math.min(1, Math.max(0, Number(stretch) || 0))
-  const outcome = rollOutcome(profile.health, hitReach(accuracy) * (1 + STRETCH_REACH * pulled))
-  const distance = Math.round(outcome.distance * 10) / 10
-  const grade = hitGrade(accuracy)
-  // `bonus`: the session's own multipliers (a PERFECT combo, friends in the server).
-  const multiplier = winsMultiplier(profile, now) * (grade ? grade.bonus : 1) * Math.max(1, Number(bonus) || 1) * (1 + STRETCH_WINS * pulled)
-  const world = profile.world
-  const worth = Math.round(rollReach(profile.health) * 10) / 10
-  const wins = Math.max(1, Math.round(baseRollWins(worth, world) * multiplier))
-  // First time into a zone: its discovery prize, paid once ever (once in each world).
-  const zone = zoneIndexAt(distance)
-  const bestKey = world === 1 ? 'bestZone2' : 'bestZone'
-  const discovered = []
-  let prize = 0
-  for (let i = profile.stats[bestKey] + 1; i <= zone; i += 1) {
-    discovered.push(i)
-    prize += WORLD_ZONES[world][i].discover
-  }
-  const best = distance > profile.stats.bestDistance
-  profile.wins += wins + prize
-  profile.stats.totalWins += wins + prize
-  profile.stats.rolls += 1
-  profile.stats.wallsBroken += outcome.broken
-  profile.stats.bestDistance = Math.max(profile.stats.bestDistance, distance)
-  profile.stats[bestKey] = Math.max(profile.stats[bestKey], zone)
-  const duration = rollDuration(distance)
-  return {
-    ok: true,
-    distance,
-    wins,
-    prize,
-    discovered,
-    blocked: outcome.blocked,
-    broken: outcome.broken,
-    multiplier,
-    hit: grade ? grade.id : null,
-    best,
-    duration,
-    cooldown: duration + ROLL_RECOVERY,
-  }
+/** Trims a progress record to `stage` (the checkpoints and pearls it has). In place. */
+export function fitProgress(progress, stage) {
+  const last = lastCheckpoint(stage)
+  progress.checkpoint = Math.min(progress.checkpoint, last)
+  progress.best.checkpoint = Math.min(progress.best.checkpoint, last)
+  for (const key of Object.keys(progress.splits)) if (Number(key) > last) delete progress.splits[key]
+  progress.pearls &= stageLookups(stage).allPearls
+  return progress
 }
 
-/** Wins (before multipliers) of a roll at your max level: what packs and skips cost in. */
-export const maxRollWins = (profile) => rollWinsAt(healthForLevel(levelCap(profile.rebirths)), profile.world)
+/** `profile`'s progress on `stage`, made on the first visit and trimmed to the stage. Mutable. */
+export function progressFor(profile, stage) {
+  profile.maps ||= {}
+  profile.maps[stage.id] ||= emptyProgress()
+  return fitProgress(profile.maps[stage.id], stage)
+}
 
-/** `rolls` max-level launches' worth of Wins: rewards that grow with you. */
-export const winsForRolls = (profile, rolls) => Math.max(10, Math.round(maxRollWins(profile) * rolls))
+// --- Chapters: locked maps -------------------------------------------------------------
 
-/** The egg item that fits how far you've got: a reward that's always worth opening. */
-export function eggItemFor(profile) {
-  if (profile.rebirths >= 10) return 'eggVolcano'
-  if (profile.rebirths >= 5) return 'eggUnicorn'
-  if (profile.rebirths >= 2) return 'eggSunset'
-  return 'eggMeadow'
+/**
+ * May `profile` play map `stageId`? A map whose registry entry has `unlock: { finish: id }`
+ * (the Grand Tour: Sky Docks) opens once that map has been finished - its best finish
+ * time is set, which also counts a finish of an older, shorter version of it - and stays
+ * open for good (`profile.unlocks`, recorded at the finish). Every other map (Sky Docks,
+ * Heat Run) is always open; an unknown id never is. The one rule the server, the offline
+ * stand-in and the client all check (shared/chapters.js has the wording).
+ */
+export function isStageUnlocked(profile, stageId) {
+  const info = stageInfo(stageId)
+  if (!info) return false
+  const need = info.unlock?.finish
+  if (!need) return true
+  if (Array.isArray(profile?.unlocks) && profile.unlocks.includes(stageId)) return true
+  return progressOf(profile, need).best.finishMs > 0
 }
 
 /**
- * Pays a reward grant of { winsRolls?, item?, egg? } (quests, lucky gifts). Returns what
- * was given: { wins, items: [itemId...] }.
+ * Records, at a finish of `stage`, every map that finishing it opens (in `profile.unlocks`,
+ * for good). Returns the ids that were still locked before - the "CHAPTER 2 UNLOCKED"
+ * moment. Call before the finish time is stored (it decides what was locked).
  */
-export function payReward(profile, grant) {
-  const out = { wins: 0, items: [] }
-  if (grant.winsRolls) {
-    out.wins = winsForRolls(profile, grant.winsRolls)
-    profile.wins += out.wins
-    profile.stats.totalWins += out.wins
+function unlockAfterFinish(profile, stage) {
+  const opened = []
+  for (const info of STAGES) {
+    if (info.unlock?.finish !== stage.id) continue
+    if (!isStageUnlocked(profile, info.id)) opened.push(info.id)
+    profile.unlocks ||= []
+    if (!profile.unlocks.includes(info.id)) profile.unlocks.push(info.id)
   }
-  if (grant.item) {
-    addItem(profile, grant.item, 1)
-    out.items.push(grant.item)
-  }
-  if (grant.egg) {
-    const egg = eggItemFor(profile)
-    addItem(profile, egg, 1)
-    out.items.push(egg)
-  }
-  return out
+  return opened
+}
+
+/** Highest altitude reached on any map (the global altitude board). */
+export const bestAltitude = (profile) => Object.values(profile?.maps || {}).reduce((m, p) => Math.max(m, p?.best?.altitude || 0), 0)
+
+/**
+ * What goes into storage: the profile plus its Sky Docks progress mirrored at the top
+ * level (the pre-`maps` layout), so a server or client still on the old code reads the
+ * right Sky Docks progress from a new save.
+ */
+export function toSaveData(profile) {
+  const sky = progressOf(profile, DEFAULT_STAGE)
+  return { ...profile, checkpoint: sky.checkpoint, best: { ...sky.best }, splits: { ...sky.splits }, pearls: sky.pearls }
 }
 
 /**
- * The Health packs as they stand for you now: `[{ amount, price }]`. Both follow the
- * Health your next level needs, and the Wins a roll with that much Health pays.
+ * A profile safe to play with, from whatever was stored: a current save repaired field
+ * by field (junk becomes defaults, unknown cars are dropped), anything else - nothing
+ * at all, or a save from the "+1 Arm Length" game this server used to run - a fresh one.
  */
-export function healthPacks(profile) {
-  const next = healthForLevel(profile.level + 1)
-  const wins = rollWinsAt(next, profile.world)
-  return HEALTH_PACKS.map((pack) => ({
-    amount: niceRound(Math.max(10, next * pack.share)),
-    price: niceRound(Math.max(3, wins * pack.rolls)),
-  }))
+export function normalizeProfile(raw, id, name, now = Date.now()) {
+  const fresh = createProfile(id, name || raw?.name, now)
+  if (!raw || typeof raw !== 'object' || raw.version !== PROFILE_VERSION) return fresh
+
+  const p = fresh
+  p.coins = wholeAtLeast0(raw.coins)
+  const cars = Array.isArray(raw.cars) ? raw.cars.filter((c) => typeof c === 'string' && CAR_BY_ID[c]) : []
+  p.cars = [...new Set([STARTER_CAR, ...cars])]
+  p.car = p.cars.includes(raw.car) ? raw.car : STARTER_CAR
+  p.slots = clampInt(raw.slots, 1, MAX_SLOTS, 1)
+  for (const kind of Object.values(COSMETIC_KINDS)) {
+    const owned = Array.isArray(raw[kind.owned]) ? raw[kind.owned].filter((c) => typeof c === 'string' && kind.byId[c]) : []
+    p[kind.owned] = [...new Set([kind.fallback, ...owned])]
+    p[kind.equipped] = p[kind.owned].includes(raw[kind.equipped]) ? raw[kind.equipped] : kind.fallback
+  }
+  // Progress per known map; the old top-level fields are Sky Docks progress.
+  const maps = raw.maps && typeof raw.maps === 'object' && !Array.isArray(raw.maps) ? raw.maps : {}
+  for (const id of STAGE_IDS) {
+    let progress = maps[id] && typeof maps[id] === 'object' ? normalizeProgress(maps[id]) : null
+    if (id === DEFAULT_STAGE && hasLegacyProgress(raw)) progress = mergeProgress(progress, normalizeProgress(raw))
+    if (progress) p.maps[id] = progress
+  }
+  // Opened chapters: known map ids only, once each.
+  if (Array.isArray(raw.unlocks)) p.unlocks = [...new Set(raw.unlocks.filter((id) => typeof id === 'string' && STAGE_IDS.includes(id)))]
+  // The pearl bank. A save from before it existed has none: it starts with every pearl
+  // found so far (once; after that the field is there). It can never exceed the pearls
+  // found, which also keeps a tampered offline save in bounds.
+  const found = foundPearls(p)
+  p.pearlBank = Number.isFinite(raw.pearlBank) ? Math.min(wholeAtLeast0(raw.pearlBank), found) : found
+  const stats = raw.stats && typeof raw.stats === 'object' ? raw.stats : {}
+  for (const key of Object.keys(p.stats)) p.stats[key] = key === 'playtime' ? at0(stats[key]) : wholeAtLeast0(stats[key])
+  p.pity = clampInt(raw.pity, 0, PITY_SPINS, 0)
+  const settings = raw.settings && typeof raw.settings === 'object' ? raw.settings : {}
+  for (const key of Object.keys(SETTINGS_DEFAULTS)) if (typeof settings[key] === 'boolean') p.settings[key] = settings[key]
+  if (Number.isFinite(raw.createdAt)) p.createdAt = raw.createdAt
+  if (Number.isFinite(raw.lastSeen)) p.lastSeen = raw.lastSeen
+  return p
 }
 
-/** Buys Health pack `index` with Wins. Packs ignore the level cap. */
-export function buyHealthPack(profile, index) {
-  const pack = healthPacks(profile)[index]
-  if (!pack) return { ok: false, error: 'Unknown pack' }
-  if (profile.wins < pack.price) return { ok: false, error: 'Not enough Wins!' }
-  profile.wins -= pack.price
-  profile.health = tidy(profile.health + pack.amount)
-  profile.stats.bestHealth = Math.max(profile.stats.bestHealth, profile.health)
-  profile.level = levelFor(profile.health, profile.rebirths)
-  return { ok: true, amount: pack.amount }
+/** Pays `amount` coins (whole, never negative); returns what was paid. */
+export function addCoins(profile, amount) {
+  const n = wholeAtLeast0(amount)
+  profile.coins += n
+  profile.stats.totalCoins += n
+  return n
 }
 
-/** Wins to rebirth now without reaching max level first. */
-export const rebirthSkipPrice = (profile) => niceRound(Math.max(20, maxRollWins(profile) * REBIRTH_SKIP_ROLLS))
-
-export function skipRebirth(profile) {
-  if (isMaxLevel(profile)) return applyRebirth(profile)
-  const price = rebirthSkipPrice(profile)
-  if (profile.wins < price) return { ok: false, error: 'Not enough Wins!' }
-  profile.wins -= price
-  profile.level = levelCap(profile.rebirths)
-  return applyRebirth(profile)
-}
-
-// --- Worlds -------------------------------------------------------------------------
+// --- Checkpoints ---------------------------------------------------------------------
 
 /**
- * Steps through the world portal: from World 1 into Palm Beach (opening it for good the
- * first time you have the rebirths and hold the Wins - they aren't spent), or from Palm
- * Beach back home.
+ * Checkpoint `index` of `stage` was reached. Only the next one counts (no skipping
+ * ahead); the first time in a run it pays, records the split and lifts your bests on
+ * that map. The last one is the finish: the summit bonus, your whole-stage time
+ * (`totalMs`, never under MIN_FINISH_MS) and the maps it opens (`unlocked`: the ids that
+ * were locked until now, isStageUnlocked).
+ *
+ * Crossing a checkpoint you already have (after a respawn) is not an error, just
+ * nothing: `{ ok: false, quiet: true }`.
  */
-export function usePortal(profile) {
-  if (profile.world === 1) {
-    profile.world = 0
-    return { ok: true, world: 0 }
+export function reachCheckpoint(profile, stage, index, { splitMs, totalMs } = {}) {
+  const last = lastCheckpoint(stage)
+  if (!Number.isInteger(index) || index < 1 || index > last) return { ok: false, error: 'Unknown checkpoint' }
+  const progress = progressFor(profile, stage)
+  if (index <= progress.checkpoint) return { ok: false, quiet: true }
+  if (index > progress.checkpoint + 1) return { ok: false, error: 'Missed a checkpoint' }
+
+  progress.checkpoint = index
+  const cp = stage.checkpoints[index]
+  let coins = addCoins(profile, CHECKPOINT_COINS(index))
+  progress.best.checkpoint = Math.max(progress.best.checkpoint, index)
+  progress.best.altitude = Math.max(progress.best.altitude, cp.y)
+
+  let best = false
+  const split = Number.isFinite(splitMs) && splitMs > 0 ? Math.round(splitMs) : 0
+  if (split && (!progress.splits[index] || split < progress.splits[index])) {
+    progress.splits[index] = split
+    best = true
   }
-  const { wins: need, rebirths } = WORLD_PORTALS.world2
-  if (!profile.world2Unlocked && profile.rebirths < rebirths) return { ok: false, error: `Need ${rebirths} Rebirths`, need, rebirths }
-  if (!profile.world2Unlocked && profile.wins < need) return { ok: false, error: `Need ${need} Wins`, need, rebirths }
-  const first = !profile.world2Unlocked
-  profile.world2Unlocked = true
-  profile.world = 1
-  return { ok: true, world: 1, first }
-}
 
-// --- Tires --------------------------------------------------------------------------
-
-export function buyTire(profile, tireId) {
-  const tire = TIRES.find((t) => t.id === tireId)
-  if (!tire) return { ok: false, error: 'Unknown arms' }
-  if (profile.ownedTires.includes(tireId)) return equipTire(profile, tireId)
-  const previous = TIRES[tireIndex(tireId) - 1]
-  if (previous && !profile.ownedTires.includes(previous.id)) {
-    return { ok: false, error: `Buy the ${previous.name} first!` }
-  }
-  if (profile.wins < tire.cost) return { ok: false, error: 'Not enough Wins!' }
-  profile.wins -= tire.cost
-  profile.ownedTires.push(tireId)
-  profile.equippedTire = tireId
-  return { ok: true, bought: true, tireId }
-}
-
-export function equipTire(profile, tireId) {
-  if (!profile.ownedTires.includes(tireId)) return { ok: false, error: 'You don’t own those arms' }
-  profile.equippedTire = tireId
-  return { ok: true, equipped: true, tireId }
-}
-
-/** The next tire in the showroom you don't have yet, or null. */
-export function nextTire(profile) {
-  return TIRES.find((t) => !profile.ownedTires.includes(t.id)) || null
-}
-
-// --- Pets --------------------------------------------------------------------------
-
-function rollPet(eggId, rand) {
-  const egg = EGGS[eggId]
-  const total = egg.pets.reduce((sum, [, w]) => sum + w, 0)
-  let r = rand() * total
-  for (const [petId, weight] of egg.pets) {
-    r -= weight
-    if (r < 0) return petId
-  }
-  return egg.pets[egg.pets.length - 1][0]
-}
-
-export function addPet(profile, petId) {
-  const pet = { uid: profile.nextPetUid++, id: petId }
-  profile.pets.push(pet)
-  // Auto-equip into a free slot, so a first pet does something straight away.
-  if (profile.equippedPets.length < MAX_EQUIPPED_PETS) profile.equippedPets.push(pet.uid)
-  return pet
-}
-
-/**
- * Hatches `count` eggs. `paid` says how: 'wins' charges the egg's Wins price, 'item'
- * consumes an egg item, 'free' is for reward grants already paid for.
- */
-export function hatchEgg(profile, eggId, count = 1, { paid = 'wins', rand = Math.random } = {}) {
-  const egg = EGGS[eggId]
-  if (!egg) return { ok: false, error: 'Unknown egg' }
-  // A world's own egg hatches in that world only (eggs from rewards included).
-  if (egg.world !== undefined && (profile.world || 0) !== egg.world) return { ok: false, error: 'Hatches in Palm Beach only!' }
-  if (profile.pets.length + count > MAX_PET_INVENTORY) return { ok: false, error: 'Pet inventory full!' }
-  if (paid === 'wins') {
-    if (!egg.cost.wins) return { ok: false, error: 'This egg is premium only' }
-    const price = egg.cost.wins * count
-    if (profile.wins < price) return { ok: false, error: 'Not enough Wins!' }
-    profile.wins -= price
-  } else if (paid === 'item') {
-    const itemId = Object.keys(ITEMS).find((k) => ITEMS[k].kind === 'egg' && ITEMS[k].egg === eggId)
-    if (!itemId || (profile.items[itemId] || 0) < count) return { ok: false, error: 'No eggs left' }
-    profile.items[itemId] -= count
-  }
-  const pets = []
-  for (let i = 0; i < count; i += 1) pets.push(addPet(profile, rollPet(eggId, rand)))
-  return { ok: true, eggId, pets }
-}
-
-export function equipPet(profile, uid) {
-  if (!profile.pets.some((p) => p.uid === uid)) return { ok: false, error: 'Unknown pet' }
-  if (profile.equippedPets.includes(uid)) return { ok: true }
-  if (profile.equippedPets.length >= MAX_EQUIPPED_PETS) return { ok: false, error: `Max ${MAX_EQUIPPED_PETS} pets equipped` }
-  profile.equippedPets.push(uid)
-  return { ok: true }
-}
-
-export function unequipPet(profile, uid) {
-  profile.equippedPets = profile.equippedPets.filter((u) => u !== uid)
-  return { ok: true }
-}
-
-const petScore = (pet) => PETS[pet.id]?.mult ?? 0
-
-export function equipBestPets(profile) {
-  const best = [...profile.pets].sort((a, b) => petScore(b) - petScore(a)).slice(0, MAX_EQUIPPED_PETS)
-  profile.equippedPets = best.map((p) => p.uid)
-  return { ok: true }
-}
-
-export function deletePet(profile, uid) {
-  const before = profile.pets.length
-  profile.pets = profile.pets.filter((p) => p.uid !== uid)
-  profile.equippedPets = profile.equippedPets.filter((u) => u !== uid)
-  return { ok: profile.pets.length < before }
-}
-
-/** Sort key for inventory display: equipped first, then rarity, then multiplier. */
-export function petSortKey(profile, pet) {
-  const info = PETS[pet.id]
-  const equipped = profile.equippedPets.includes(pet.uid) ? 1 : 0
-  return equipped * 1e6 + (RARITIES[info.rarity]?.order ?? 0) * 1e4 + info.mult
-}
-
-// --- Items & boosts ---------------------------------------------------------------
-
-export function addItem(profile, itemId, amount = 1) {
-  profile.items[itemId] = (profile.items[itemId] || 0) + amount
-}
-
-export function usePotion(profile, itemId, now) {
-  const item = ITEMS[itemId]
-  if (!item || item.kind !== 'potion') return { ok: false, error: 'Not a potion' }
-  if ((profile.items[itemId] || 0) <= 0) return { ok: false, error: 'None left' }
-  profile.items[itemId] -= 1
-  // Stacks: a second potion extends the timer instead of wasting it.
-  profile.boosts[item.boost] = Math.max(profile.boosts[item.boost] || 0, now) + item.durationMs
-  return { ok: true, boost: item.boost, endsAt: profile.boosts[item.boost] }
-}
-
-/** Applies a reward grant: { wins } | { item } | { pet } | { health } | { hatch }. */
-export function applyGrant(profile, grant, { rand = Math.random } = {}) {
-  const result = { ok: true }
-  if (grant.wins) {
-    profile.wins += grant.wins
-    profile.stats.totalWins += grant.wins
-  }
-  if (grant.health) {
-    profile.health = tidy(profile.health + grant.health)
-    profile.stats.bestHealth = Math.max(profile.stats.bestHealth, profile.health)
-    profile.level = levelFor(profile.health, profile.rebirths)
-  }
-  if (grant.item) addItem(profile, grant.item, grant.amount || 1)
-  if (grant.pet) result.pets = [addPet(profile, grant.pet)]
-  if (grant.hatch) {
-    const hatched = hatchEgg(profile, grant.hatch, 1, { paid: 'free', rand })
-    if (!hatched.ok) return hatched
-    result.pets = hatched.pets
-    result.eggId = grant.hatch
+  const result = { ok: true, index, coins, splitMs: split, best, finish: false }
+  if (cp.finish) {
+    // Maps this finish opens (the next chapter), decided before the time is stored.
+    result.unlocked = unlockAfterFinish(profile, stage)
+    coins += addCoins(profile, FINISH_BONUS)
+    profile.stats.finishes += 1
+    const total = Number.isFinite(totalMs) ? Math.max(MIN_FINISH_MS, Math.round(totalMs)) : 0
+    if (total && (!progress.best.finishMs || total < progress.best.finishMs)) progress.best.finishMs = total
+    Object.assign(result, { coins, finish: true, totalMs: total })
   }
   return result
 }
 
-// --- Daily & playtime rewards -------------------------------------------------------
+/** Back to the lobby: the run on `stage` starts again from the Start gate. */
+export function restartRun(profile, stage) {
+  progressFor(profile, stage).checkpoint = 0
+}
+
+// --- Coins and tricks ----------------------------------------------------------------
+
+/** How many of `stage`'s Sky Pearls the bitmask `pearls` holds. */
+export function countPearls(pearls, stage) {
+  let n = 0
+  for (let m = (pearls || 0) & stageLookups(stage).allPearls; m; m &= m - 1) n += 1
+  return n
+}
 
 /**
- * State of each daily reward: 'claimed' | 'ready' | 'next' (with `unlocksIn` ms) |
- * 'locked'. A new 7-day cycle starts on first claim after the last one finishes.
+ * Finds Sky Pearl `index` of `stage` (the caller has checked distance). The first time
+ * it pays PEARL_COINS and adds one to the spendable pearl bank, plus PEARL_SET_BONUS for
+ * the last one of that map's set.
  */
-export function dailyStatus(profile, now) {
-  const { start, claimed } = profile.daily
-  const fresh = !start || claimed.length >= DAILY_REWARDS.length
-  const cycleStart = fresh ? now : start
-  let nextShown = false
-  return DAILY_REWARDS.map((reward, day) => {
-    if (!fresh && claimed.includes(day)) return { day, state: 'claimed' }
-    const unlockAt = cycleStart + day * DAILY_INTERVAL_MS
-    if (now >= unlockAt) return { day, state: 'ready' }
-    if (!nextShown) {
-      nextShown = true
-      return { day, state: 'next', unlocksIn: unlockAt - now }
-    }
-    return { day, state: 'locked' }
-  })
+export function collectPearl(profile, stage, index) {
+  if (!stageLookups(stage).pearlByIndex.has(index)) return { ok: false, quiet: true }
+  const progress = progressFor(profile, stage)
+  const bit = 1 << index
+  if (progress.pearls & bit) return { ok: false, quiet: true }
+  progress.pearls |= bit
+  profile.pearlBank = wholeAtLeast0(profile.pearlBank) + 1
+  let coins = addCoins(profile, PEARL_COINS)
+  const found = countPearls(progress.pearls, stage)
+  const total = stage.pearls.length
+  const complete = found === total
+  if (complete) coins += addCoins(profile, PEARL_SET_BONUS)
+  return { ok: true, index, found, total, coins, complete, bank: profile.pearlBank }
 }
 
-export function claimDaily(profile, day, now, opts) {
-  const status = dailyStatus(profile, now)[day]
-  if (!status || status.state !== 'ready') return { ok: false, error: 'Not ready yet' }
-  if (!profile.daily.start || profile.daily.claimed.length >= DAILY_REWARDS.length) {
-    profile.daily = { start: now, claimed: [] }
+/** Pays one treasure chest (the caller has checked distance and once-per-run). */
+export const collectChest = (profile) => addCoins(profile, CHEST_COINS)
+
+/** Pays one track coin (the caller has checked distance, once-per-run and rate). */
+export const collectCoin = (profile) => addCoins(profile, COIN_VALUE)
+
+/** Coins a trick of `score` points is worth before the per-minute cap. */
+export const trickCoins = (score) => (Number.isFinite(score) && score > 0 ? Math.floor(Math.min(score, MAX_TRICK_SCORE) / TRICK_POINTS_PER_COIN) : 0)
+
+// --- Car spins -----------------------------------------------------------------------
+
+const PITY_RARITIES = ['legendary', 'mythic']
+
+/** Picks a rarity by RARITY_INFO weight from those in `allowed`. */
+function pickRarity(allowed, rand) {
+  const total = allowed.reduce((sum, r) => sum + RARITY_INFO[r].weight, 0)
+  let roll = rand() * total
+  for (const r of allowed) {
+    roll -= RARITY_INFO[r].weight
+    if (roll < 0) return r
   }
-  profile.daily.claimed.push(day)
-  const result = applyGrant(profile, DAILY_REWARDS[day].grant, opts)
-  return { ...result, day, label: DAILY_REWARDS[day].label }
+  return allowed[allowed.length - 1]
 }
 
-export function playtimeStatus(session, now) {
-  const minutes = (now - session.start) / 60000
-  return PLAYTIME_REWARDS.map((reward, index) => {
-    if (session.playtimeClaimed.includes(index)) return { index, state: 'claimed' }
-    if (minutes >= reward.minutes) return { index, state: 'ready' }
-    return { index, state: 'locked', unlocksIn: (reward.minutes - minutes) * 60000 }
-  })
+/**
+ * One car spin (already paid for). Rarity by weight, with pity: the PITY_SPINS-th spin
+ * in a row without a Legendary or better is guaranteed one. `minRarity` limits the
+ * draw to that rarity and up (the Mega Spin). A new car joins your garage; a car you
+ * have pays back at least `paid` (what the spin cost; 0 for a free spin) or its
+ * DUPLICATE_REFUND, whichever is more.
+ *
+ * @returns {{ ok: true, carId: string, rarity: string, isNew: boolean, refund: number }}
+ */
+export function rollSpin(profile, rand = Math.random, { minRarity = 'common', paid = 0 } = {}) {
+  let allowed = RARITIES.slice(Math.max(0, RARITIES.indexOf(minRarity)))
+  if (profile.pity + 1 >= PITY_SPINS) allowed = allowed.filter((r) => PITY_RARITIES.includes(r))
+  const rarity = pickRarity(allowed, rand)
+  const pool = CARS.filter((c) => c.rarity === rarity)
+  const car = pool[Math.min(pool.length - 1, Math.floor(rand() * pool.length))]
+
+  profile.stats.spins += 1
+  profile.pity = PITY_RARITIES.includes(rarity) ? 0 : profile.pity + 1
+  const isNew = !profile.cars.includes(car.id)
+  let refund = 0
+  if (isNew) profile.cars.push(car.id)
+  // A car you already have: your coins back - at least what this spin cost (`paid`),
+  // or the rarity's refund if that's more (free spins pay just the rarity refund).
+  else refund = addCoins(profile, Math.max(DUPLICATE_REFUND[rarity], paid))
+  return { ok: true, carId: car.id, rarity, isNew, refund }
 }
 
-export function claimPlaytime(profile, session, index, now, opts) {
-  const status = playtimeStatus(session, now)[index]
-  if (!status || status.state !== 'ready') return { ok: false, error: 'Not ready yet' }
-  session.playtimeClaimed.push(index)
-  const result = applyGrant(profile, PLAYTIME_REWARDS[index].grant, opts)
-  return { ...result, index, label: PLAYTIME_REWARDS[index].label }
+/** A coin spin: SPIN_COST, then rollSpin. */
+export function buySpin(profile, rand = Math.random) {
+  if (profile.coins < SPIN_COST) return { ok: false, error: `A spin costs ${SPIN_COST} coins` }
+  profile.coins -= SPIN_COST
+  return rollSpin(profile, rand, { paid: SPIN_COST })
 }
 
-export function claimFreeReward(profile, session, opts) {
-  if (session.freeRewardTaken) return { ok: false, error: 'Already claimed this session' }
-  session.freeRewardTaken = true
-  const grant = profile.freeRewardClaimed ? FREE_REWARD.repeat : FREE_REWARD.firstTime
-  profile.freeRewardClaimed = true
-  return { ...applyGrant(profile, grant, opts), grant }
+export function equipCar(profile, id) {
+  if (!profile.cars.includes(id)) return { ok: false, error: "You don't own that car yet" }
+  profile.car = id
+  return { ok: true }
 }
 
-// --- Shop ---------------------------------------------------------------------------
-
-/** Buys a SHOP item with Wins. */
-export function buyShopItem(profile, productId, opts = {}) {
-  const item = SHOP[productId]
+/** Buys cosmetic `id` of `kind` ('paint' | 'nitro') with coins and puts it on. */
+export function buyCosmetic(profile, kind, id) {
+  const k = COSMETIC_KINDS[kind]
+  const item = k?.byId[id]
   if (!item) return { ok: false, error: 'Unknown item' }
-  if (item.kind === 'pass' && profile.passes[productId]) return { ok: false, error: 'Already owned' }
-  if (profile.wins < item.price) return { ok: false, error: 'Not enough Wins!' }
-  if (item.kind === 'pass') {
-    profile.wins -= item.price
-    profile.passes[productId] = true
-    // Auto Roll switches itself on once bought.
-    if (productId === 'autoRoll') profile.settings.autoRoll = true
-    return { ok: true, productId, pass: true }
-  }
-  const result = applyGrant(profile, item.grant || {}, opts)
-  if (result.ok) profile.wins -= item.price
-  return { ...result, productId }
+  if (profile[k.owned].includes(id)) return { ok: false, error: 'You already own that' }
+  if (profile.coins < item.price) return { ok: false, error: `${item.name} costs ${item.price} coins` }
+  profile.coins -= item.price
+  profile[k.owned].push(id)
+  profile[k.equipped] = id
+  return { ok: true, kind, id, cost: item.price }
 }
 
-// --- Boxity Gems and rewarded ads ------------------------------------------------
+/** Puts on a cosmetic you own. */
+export function equipCosmetic(profile, kind, id) {
+  const k = COSMETIC_KINDS[kind]
+  if (!k || !profile[k.owned].includes(id)) return { ok: false, error: "You don't own that yet" }
+  profile[k.equipped] = id
+  return { ok: true }
+}
+
+export function unlockSlot(profile) {
+  if (profile.slots >= MAX_SLOTS) return { ok: false, error: 'All item slots are open' }
+  const cost = SLOT_COSTS[profile.slots + 1]
+  if (profile.coins < cost) return { ok: false, error: `The next slot costs ${cost} coins` }
+  profile.coins -= cost
+  profile.slots += 1
+  return { ok: true, slots: profile.slots, cost }
+}
+
+export function applySetting(profile, key, value) {
+  if (!(key in SETTINGS_DEFAULTS) || typeof value !== 'boolean') return { ok: false, error: 'Unknown setting' }
+  profile.settings[key] = value
+  return { ok: true }
+}
+
+// --- Store and Boxity grants ---------------------------------------------------------
 
 /**
- * Grants Gems product `sku`, already paid for in Boxity. Passes you own already turn
- * into a Wins pack of the same worth, so nothing bought is ever wasted.
+ * A store product ('purchase'): paid for with coins or, for `kind: 'pearls'`, with Sky
+ * Pearls from the bank. Checked and charged in one step, so nothing is taken from a
+ * player who can't pay (or, for the item slot, who has every slot open already).
+ *
+ * @returns {{ ok: true, spin?: true, pearls?: number, coins?: number, slots?: number } | { ok: false, error: string }}
  */
-export function applyGemProduct(profile, sku) {
-  const product = GEM_PRODUCTS[sku]
+export function buyProduct(profile, productId, rand = Math.random) {
+  const product = Object.hasOwn(PRODUCT_BY_ID, productId) ? PRODUCT_BY_ID[productId] : null
   if (!product) return { ok: false, error: 'Unknown product' }
-  const { grant } = product
-  const result = { ok: true, sku, name: product.name }
-  if (grant.pass) {
-    if (profile.passes[grant.pass]) {
-      result.wins = Math.max(10, Math.round(maxRollWins(profile) * 20))
-    } else {
-      profile.passes[grant.pass] = true
-      if (grant.pass === 'autoRoll') profile.settings.autoRoll = true
-      result.pass = grant.pass
-    }
+  if (product.kind === 'pearls') return buyPearlProduct(profile, product)
+  if (product.kind !== 'coins') return { ok: false, error: 'Unknown product' }
+  if (profile.coins < product.price) return { ok: false, error: `${product.name} costs ${product.priceLabel}` }
+  profile.coins -= product.price
+  if (productId === 'mega_spin') return { ...rollSpin(profile, rand, { minRarity: 'epic', paid: product.price }), spin: true }
+  return { ok: true }
+}
+
+/** A pearl-priced product: coin packs pay their coins, the slot pass opens the next slot. */
+function buyPearlProduct(profile, product) {
+  if (product.id === 'slot_pass' && profile.slots >= MAX_SLOTS) return { ok: false, error: 'All item slots are open' }
+  const bank = wholeAtLeast0(profile.pearlBank)
+  if (bank < product.price) return { ok: false, error: `Not enough pearls: ${product.name} costs ${product.priceLabel}` }
+  profile.pearlBank = bank - product.price
+  const result = { ok: true, productId: product.id, name: product.name, pearls: product.price, coins: 0 }
+  if (product.id === 'slot_pass') {
+    profile.slots += 1
+    result.slots = profile.slots
+  } else if (product.coins > 0) {
+    // A conversion of pearls already counted when found, not new earnings: the coins
+    // leaderboard (stats.totalCoins) doesn't move.
+    profile.coins += product.coins
+    result.coins = product.coins
   }
-  if (grant.winsRolls) result.wins = (result.wins || 0) + Math.max(25, Math.round(maxRollWins(profile) * grant.winsRolls))
-  if (result.wins) {
-    profile.wins += result.wins
-    profile.stats.totalWins += result.wins
-  }
-  for (const [itemId, amount] of Object.entries(grant.items || {})) addItem(profile, itemId, amount)
   return result
 }
 
-/** A rewarded ad's prize for `placement`, if it's off cooldown (`session.adAt`). */
-export function applyAdReward(profile, session, placement, now) {
+/**
+ * A rewarded ad's grant, within the placement's cooldown. `adAt` is the session's
+ * record of when each placement last paid (not saved: a cooldown, not a balance).
+ */
+export function applyAdReward(profile, adAt, placement, now, rand = Math.random) {
   const reward = AD_REWARDS[placement]
   if (!reward) return { ok: false, error: 'Unknown reward' }
-  session.adAt = session.adAt || {}
-  if (now - (session.adAt[placement] || 0) < reward.cooldownMs) return { ok: false, error: 'Not ready yet' }
-  session.adAt[placement] = now
-  return { ...applyGrant(profile, reward.grant), placement, label: reward.label }
-}
-
-// --- Offline progress -------------------------------------------------------------
-
-/** Health earned while away, if the player logged off on a training pad. */
-export function applyOfflineProgress(profile, now) {
-  const away = Math.min(OFFLINE_MAX_MS, now - (profile.lastSeen || now))
-  if (profile.lastPad < 0 || away < OFFLINE_MIN_MS) return null
-  if (!isPadUnlocked(profile, profile.lastPad) || isMaxLevel(profile)) return null
-  const steps = Math.floor(away / 1000 / TRAIN_INTERVAL)
-  // Potions don't run while you're away.
-  const gain = padGain(profile, profile.lastPad, 0)
-  const result = addHealth(profile, Math.floor(steps * gain * OFFLINE_RATE))
-  if (result.gain <= 0) return null
-  return { health: result.gain, ms: away }
-}
-
-// --- Tutorial & badges ------------------------------------------------------------
-
-/** Advances the tutorial if `event` completes the current step. */
-export function advanceTutorial(profile, event) {
-  const step = TUTORIAL[profile.tutorialStep]
-  if (!step || step.event !== event) return false
-  if (step.health && profile.health < step.health) return false
-  profile.tutorialStep += 1
-  return true
-}
-
-/** Awards a badge once. Returns the badge if newly awarded. */
-/**
- * Finds Palm Beach's Secret Star (the caller checks the player is at it, in Palm Beach).
- * Once only; false if it was already found.
- */
-export function claimSecretStar(profile) {
-  if ((profile.world || 0) !== SECRET_STAR.world || profile.secretStars?.world2) return false
-  profile.secretStars = { ...profile.secretStars, world2: true }
-  return true
-}
-
-export function awardBadge(profile, id) {
-  if (!BADGES[id] || profile.badges.includes(id)) return null
-  profile.badges.push(id)
-  return { id, ...BADGES[id] }
+  if (now - (adAt[placement] || 0) < reward.cooldownMs) return { ok: false, error: 'Not ready yet' }
+  adAt[placement] = now
+  const result = { ok: true, placement, label: reward.label }
+  if (reward.grant.spin) Object.assign(result, rollSpin(profile, rand), { spin: true, label: reward.label })
+  return result
 }

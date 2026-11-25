@@ -1,72 +1,111 @@
-import { useCallback } from 'react'
+import { lazy, Suspense } from 'react'
 
-import { setSpeedTunnelElement } from '../../game/roll/hudLink'
+import { stageInfo } from '@shared/stages/index'
+
 import { useGame } from '../../store/game'
-import EggPanel from './EggPanel'
-import InteractPrompt from './InteractPrompt'
-import LeftMenu from './LeftMenu'
-import HealthBar from './HealthBar'
-import PassButtons from './PassButtons'
-import HitFlash from './HitFlash'
-import RollButton from './RollButton'
-import RollOverlay from './RollOverlay'
-import StatsPanel from './StatsPanel'
-import TopBar from './TopBar'
-import TopCenter from './TopCenter'
+import { FlatFill } from '../flatFill'
+import { IS_TOUCH } from '../touch'
+import AltitudeRail from './AltitudeRail'
+import BrandCorner from './BrandCorner'
+import CheckpointCard from './CheckpointCard'
+import DriftMeter from './DriftMeter'
+import FinishCard from './FinishCard'
+import ItemSlots from './ItemSlots'
+import NameTag from './NameTag'
+import NitroBar from './NitroBar'
+import PadPrompt from './PadPrompt'
+import SectionBanner from './SectionBanner'
+import SpeedFX from './SpeedFX'
+import SpeedGauge from './SpeedGauge'
+import SplitCard from './SplitCard'
+import Toasts from './Toasts'
+import { u } from './style'
+import './hudFlat.css'
 
-/**
- * The heads-up display, laid out like the reference: Rebirths and Wins top-left over
- * the menu tiles, the passes on the right, your Health, level bar and Health packs
- * bottom-centre, the tutorial top-centre, and sound, daily rewards, leaderboards and
- * your name tag top-right.
- *
- * The root ignores pointer events so the canvas and joystick underneath keep working;
- * only the buttons themselves opt back in. While a panel is open the HUD steps aside,
- * as in the reference.
- */
-/**
- * The speed tunnel: white streaks rushing outwards and a soft haze round the screen's
- * edges, the middle left clear - the sides blur past as the ball flies. A plain DOM
- * layer under the rest of the HUD (no post-processing, so it's on every preset); the
- * roll writes its strength straight to it (hudLink.writeSpeed), never through React.
- */
-function SpeedTunnel() {
-  const ref = useCallback((el) => setSpeedTunnelElement(el), [])
+/** Heat Run's heat stars / BUSTED meter (its own lazy chunk), only on a `mode: 'heat'` map. */
+const HeatHud = lazy(() => import('./HeatHud'))
+function ModeHud() {
+  const mode = useGame((s) => stageInfo(s.stageId)?.mode)
+  if (mode !== 'heat') return null
   return (
-    <div ref={ref} className="pointer-events-none absolute inset-0 overflow-hidden" style={{ opacity: 0, visibility: 'hidden' }}>
-      <div className="pp-tunnel absolute" />
-      <div className="pp-tunnel-haze absolute inset-0" />
+    <Suspense fallback={null}>
+      <HeatHud />
+    </Suspense>
+  )
+}
+
+/** A small "Reconnecting…" chip while the connection is down mid-game. */
+function NetChip() {
+  const mode = useGame((s) => s.net.mode)
+  const message = useGame((s) => s.net.message)
+  if (mode !== 'connecting' || !message) return null
+  return (
+    <div
+      className="hud-net pp-stroke"
+      style={{ fontSize: u(22), padding: `${u(4)} ${u(14)}`, borderRadius: u(12), background: 'rgba(13,21,48,0.75)' }}
+    >
+      {message}
     </div>
   )
 }
 
+/**
+ * The in-game HUD, laid out for Up We Drive (positions live in index.css so the media
+ * queries and the touch layout can move them):
+ *
+ * - behind everything: the speed-lines / vignette layer (SpeedFX)
+ * - top left: the brand card (logo, coins, pearls) over the menu dock, every button
+ *   wearing its keyboard shortcut (BrandCorner)
+ * - top centre: the timer card (next checkpoint, section, split timer, best) and, for
+ *   a few seconds after each checkpoint, the split card under it
+ * - right edge: your name tag (opens the garage), altitude + race position and the
+ *   climbing rail with every racer on it
+ * - bottom left: the speedometer (AIR tag above it)
+ * - bottom centre: the nitro bar (SHIFT) over the item slots (Q / E / F)
+ *   (touch: gauge bottom centre with the nitro bar over it, items on the TouchControls)
+ * - upper middle: one column - connection chip, live drift meter, section banner, toasts - so they
+ *   stack instead of overlapping when a checkpoint fires them all at once
+ * - centre: the drive-in pad prompt and the finish card
+ *
+ * Everything that changes per frame is written by the live loop (useLive.js), so this
+ * tree only re-renders on real game events.
+ */
+/**
+ * The HUD draws flat (FlatFill, ./hudFlat.css): solid fills, hard offset shadows and the
+ * hazard stripes - no smooth gradients, blurs, filters or idle animations - so the browser
+ * has only a handful of GPU raster shaders to build the first time it paints it (they cost
+ * ~3 s of GPU time on a cold browser, a freeze right after the loading screen).
+ */
 export function HUD() {
-  const panelOpen = useGame((s) => s.panel !== null)
-  // While your ball flies the side menus clear out, as in the reference.
-  const rolling = useGame((s) => Boolean(s.roll || s.rollResult))
   return (
-    <div className="pp-font pointer-events-none absolute inset-0 z-20 select-none">
-      <div className="absolute inset-0 transition-opacity duration-150" style={{ opacity: panelOpen ? 0 : 1, visibility: panelOpen ? 'hidden' : 'visible' }}>
-        <SpeedTunnel />
-        <TopBar />
-        <StatsPanel />
-        {/* Hidden, not unmounted, while rolling: remounting them at the moment of the
-            push-off cost a visible hitch on slow phones. display: none (not visibility)
-            takes them out of style and layout altogether, so the counters changing every
-            frame of a flight don't re-lay them out each time. */}
-        <div style={{ display: rolling ? 'none' : 'contents' }}>
-          <LeftMenu />
-          <PassButtons />
-          <TopCenter />
+    <FlatFill.Provider value>
+      <div className="hud-root pp-font pointer-events-none absolute inset-0 z-20 select-none" data-touch={IS_TOUCH ? '1' : '0'}>
+        <SpeedFX />
+        <BrandCorner />
+        <div className="hud-top pointer-events-none absolute">
+          <CheckpointCard />
+          <SplitCard />
         </div>
-        <HealthBar />
-        <RollButton />
-        <InteractPrompt />
-        <EggPanel />
-        <RollOverlay />
-        <HitFlash />
+        <div className="hud-right pointer-events-none absolute flex flex-col items-end">
+          <NameTag />
+          <AltitudeRail />
+        </div>
+        <SpeedGauge />
+        <div className="hud-dock pointer-events-none absolute flex flex-col items-center">
+          <NitroBar />
+          <ItemSlots />
+        </div>
+        <div className="hud-center pointer-events-none absolute flex flex-col items-center" style={{ gap: u(10) }}>
+          <NetChip />
+          <DriftMeter />
+          <SectionBanner />
+          <Toasts />
+        </div>
+        <ModeHud />
+        <PadPrompt />
+        <FinishCard />
       </div>
-    </div>
+    </FlatFill.Provider>
   )
 }
 

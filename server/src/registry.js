@@ -7,6 +7,9 @@
 /** playerId -> { room, client } */
 export const activePlayers = new Map()
 
+/** playerId -> the save a room is writing as that player leaves (a map change joins another room straight after). */
+export const pendingSaves = new Map()
+
 /** Every live GameRoom, for cross-room broadcasts (stock counters, boards). */
 export const liveRooms = new Set()
 

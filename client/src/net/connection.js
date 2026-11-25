@@ -1,16 +1,18 @@
-import { reportedAnim } from '../bloxity/emotes'
+import { STAGE_LOCKED } from '@shared/chapters'
+import { isStageUnlocked } from '@shared/logic'
+
 import { environment } from '../bloxity/env'
 import { GAME_SLUG, joinToken } from '../bloxity/identity'
 import { getSDK, safeCall, waitForSDK } from '../bloxity/sdk'
-import { LAUNCH_STAND } from '@shared/world'
 
-import { meterAtZ } from '../game/roll/path'
+import { hub as missileHub } from '../game/fx/missileHub'
 import { runtime } from '../game/runtime'
+import { setServerStageSwitch, stageRefused, travelTo } from '../game/stageRuntime'
 import { getGame } from '../store/game'
-import { setTransport } from './actions'
+import { actions, setTransport } from './actions'
 import { handleServerEvent } from './events'
 import { createLocalServer } from './localServer'
-import { clearRemotePlayers, removeRemotePlayer, upsertRemotePlayer } from './remotePlayers'
+import { applyPoseBatch, bumpedBy, clearRemotePlayers, removeRemotePlayer, upsertRemotePlayer } from './remotePlayers'
 
 /** Position reports per second (the server validates each against the last). */
 const POSITION_HZ = 10
@@ -21,6 +23,9 @@ const DUPLICATE_LOGIN = 4100
 /** Matchmaker: give up and play offline after this long (it holds a cold start ~45 s). */
 const MATCHMAKER_GIVE_UP_MS = 60_000
 const MATCHMAKER_BACKOFF_MS = [1000, 2000, 4000, 8000, 10000]
+/** A locked-map refusal our own profile disagrees with: retries, and the wait between. */
+const LOCKED_RETRIES = 3
+const LOCKED_RETRY_MS = 1500
 
 const params = new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '')
 
@@ -64,7 +69,7 @@ async function findDevServer() {
   for (const port of DEV_PORTS) candidates.push(`${window.location.protocol}//${window.location.hostname}:${port}`)
   for (const url of new Set(candidates)) {
     const health = await healthOf(url)
-    if (health?.ok && health.game === '1-arm-length') return url
+    if (health?.ok && health.game === 'drive-only-up-car-obby') return url
   }
   return null
 }
@@ -104,7 +109,8 @@ function sdkGame(method, ...args) {
  * the server verifies it. `token` is null for guests.
  */
 function joinOptions(identity) {
-  return { playerId: identity.id, name: identity.name, token: joinToken(), gameSlug: GAME_SLUG }
+  // `stage`: the map we're on - the matchmaker only puts us in a room of that map.
+  return { playerId: identity.id, name: identity.name, token: joinToken(), gameSlug: GAME_SLUG, stage: getGame().stageId }
 }
 
 /** The server's /api/health answer, or null if it can't be reached. */
@@ -118,8 +124,8 @@ async function healthOf(url) {
 }
 
 function startLocal(identity, message) {
-  const local = createLocalServer({ ...identity, onEvent: handleServerEvent })
-  active = { kind: 'local', close: () => local.close() }
+  const local = createLocalServer({ ...identity, stageId: getGame().stageId, onEvent: handleServerEvent })
+  active = { kind: 'local', local, close: () => local.close() }
   setTransport(local)
   // Not in a joinable room: friends can't be sent here.
   sdkGame('updateRoom', '')
@@ -142,6 +148,24 @@ function rejoinEndpoint(endpoint) {
   return `${environment().playUrl.replace(/^http/i, 'ws')}/v1/ws/${match[1]}`
 }
 
+/**
+ * A join the room refused because its map is still locked for this profile (a chapter:
+ * GameRoom.checkUnlocked, code STAGE_LOCKED). Returns null for any other error;
+ * 'retry' when our own copy of the profile says the map IS unlocked - the room hasn't
+ * seen the save that unlocked it yet (a finish just recorded, the save still landing,
+ * maybe on another pod) - for up to LOCKED_RETRIES tries; else shows the room's message
+ * and, when it was our own map's room (not a lobby code to someone else's), puts us
+ * back on Sky Docks - and returns 'fallback': carry on with a public lobby of the map
+ * we're on now.
+ */
+function lockedJoin(err, lobby, tries) {
+  if (err?.code !== STAGE_LOCKED) return null
+  const game = getGame()
+  if (lobby?.mode !== 'join' && isStageUnlocked(game.profile, game.stageId) && tries < LOCKED_RETRIES) return 'retry'
+  stageRefused(lobby?.mode === 'join' ? null : game.stageId, err.message, { fromServer: true })
+  return 'fallback'
+}
+
 /** `new Client(endpoint).joinById(roomId, options)`, or null if that fails. */
 async function tryJoinById(Client, endpoint, roomId, options) {
   if (!endpoint || !roomId) return null
@@ -149,6 +173,8 @@ async function tryJoinById(Client, endpoint, roomId, options) {
     return await new Client(endpoint).joinById(roomId, options)
   } catch (err) {
     console.warn(`[net] could not join room ${roomId}`, err)
+    // An invite to a locked chapter's room: say why (then matchmaking carries on).
+    lockedJoin(err, { mode: 'join' }, LOCKED_RETRIES)
     return null
   }
 }
@@ -214,33 +240,43 @@ function attachRoom(room, identity, Callbacks, endpoint, gen) {
     })
   }
 
+  // Everyone else's car poses, batched and binary (one message per server tick).
+  room.onMessage('P', applyPoseBatch)
   room.onMessage('*', (type, payload) => {
     switch (type) {
       case 'spawn':
-        runtime.player.position.set(payload.x, 0, payload.z)
+        // A room of another map (joined by code or invite): go to that map.
+        if (payload.stage && payload.stage !== getGame().stageId) travelTo(payload.stage, { fromServer: true })
+        // Arrived through a portal: a fresh run on this map.
+        else if (getGame().travel) actions.restart()
+        runtime.input.teleport = { x: payload.x, y: payload.y ?? 2, z: payload.z }
         break
       case 'correct':
-        runtime.player.position.set(payload.x, payload.y, payload.z)
+        // The server put us somewhere (a move it refused): the car goes there.
+        runtime.input.teleport = { x: payload.x, y: payload.y ?? 2, z: payload.z }
         break
-      case 'stock':
-        getGame().setSphinxStock(payload.sphinx)
+      case 'bump': {
+        // Another player rammed us; the room has checked it. The car applies it next frame.
+        const x = Number(payload?.x)
+        const y = Number(payload?.y)
+        const z = Number(payload?.z)
+        if ([x, y, z].every(Number.isFinite)) runtime.input.bump = { x, y, z, name: bumpedBy(String(payload.from || '')) }
+        break
+      }
+      case 'shot':
+        // Another player fired a Rocket Missile (`you`: at us): draw it (game/fx/missiles.js).
+        missileHub.remoteShot?.(String(payload?.from || ''), String(payload?.to || ''), payload?.you === true)
+        break
+      case 'burn':
+        // Another player's missile hit us; the room has checked it. The car applies it next frame.
+        runtime.input.burn = { name: bumpedBy(String(payload?.from || '')), from: String(payload?.from || '') }
+        break
+      case 'missileResult':
+        // Our missile hit player `to` (or their Bubble Shield stopped it).
+        getGame().showToast(payload?.ok ? 'HIT!' : 'BLOCKED', payload?.ok ? 'success' : 'info')
         break
       case 'leaderboards':
         getGame().setLeaderboards(payload)
-        break
-      case 'ghostRoll':
-        // Never your own launch (you're flying already), and only launches down your
-        // world's runway. Their avatar replays it (remote/): from the launch posts, as far
-        // back as they'd walked.
-        if (payload.sid === room.sessionId) break
-        if ((payload.world || 0) !== (getGame().profile.world || 0)) break
-        runtime.ghostRolls.set(payload.sid, {
-          ...payload,
-          fromMeter: meterAtZ(LAUNCH_STAND.z),
-          startX: LAUNCH_STAND.x,
-          pull: Math.max(0, payload.z - LAUNCH_STAND.z),
-          startedAt: performance.now(),
-        })
         break
       case 'kicked':
         leaving = true
@@ -274,20 +310,19 @@ function attachRoom(room, identity, Callbacks, endpoint, gen) {
   }
   sendLook()
 
-  // ~10 Hz position reports, skipped while standing still and doing nothing new.
-  let last = { x: NaN, y: NaN, z: NaN, a: '' }
+  // ~10 Hz car pose reports, skipped while parked.
+  let last = { x: NaN, y: NaN, z: NaN, b: false }
   let lastSentAt = 0
   const posId = setInterval(() => {
-    const p = runtime.player.position
-    // A Boxity emote plays as anim 'emote:<id>' (see bloxity/emotes.js).
-    const a = reportedAnim(runtime.player.anim)
-    runtime.player.anim = a
+    const car = runtime.car
+    const p = car.position
+    const q = car.quaternion
     const now = performance.now()
     const moved = Math.abs(p.x - last.x) + Math.abs(p.y - last.y) + Math.abs(p.z - last.z) > 0.03
-    if (!moved && a === last.a && now - lastSentAt < 1000) return
-    last = { x: p.x, y: p.y, z: p.z, a }
+    if (!moved && car.boosting === last.b && now - lastSentAt < 1000) return
+    last = { x: p.x, y: p.y, z: p.z, b: car.boosting }
     lastSentAt = now
-    room.send('pos', { x: p.x, y: p.y, z: p.z, r: runtime.player.yaw, a })
+    room.send('pos', { x: p.x, y: p.y, z: p.z, qx: q.x, qy: q.y, qz: q.z, qw: q.w, b: car.boosting })
   }, 1000 / POSITION_HZ)
 
   room.onDrop(() => getGame().setNet({ mode: 'connecting', message: 'Reconnecting…' }))
@@ -407,10 +442,12 @@ export async function startConnection(identity, lobby = { mode: 'public' }) {
   }
 
   const client = new Client(url)
+  let lockedTries = 0
   for (let attempt = 0; attempt <= JOIN_RETRIES; attempt += 1) {
+    const lobbyNow = attempt === 0 ? fallback : { mode: 'public' }
     try {
       // After a failed private/join attempt, fall back to a public lobby.
-      const room = await join(client, joinOptions(identity), attempt === 0 ? fallback : { mode: 'public' })
+      const room = await join(client, joinOptions(identity), lobbyNow)
       if (gen !== generation) {
         room.leave(true)
         return
@@ -420,6 +457,17 @@ export async function startConnection(identity, lobby = { mode: 'public' }) {
     } catch (err) {
       if (gen !== generation) return
       console.warn('[net] join failed', err)
+      // A locked chapter: wait for the room to catch up with our unlock, or go public on
+      // the map we may play (no "server full" wait).
+      const locked = lockedJoin(err, lobbyNow, lockedTries)
+      if (locked === 'retry') {
+        lockedTries += 1
+        attempt -= 1
+        await wait(LOCKED_RETRY_MS)
+        if (gen !== generation) return
+        continue
+      }
+      if (locked === 'fallback') continue
       if (attempt >= 1) getGame().setNet({ mode: 'connecting', message: 'Server full, retrying…' })
       await wait(attempt === 0 ? 300 : RETRY_DELAY_MS)
       if (gen !== generation) return
@@ -445,11 +493,13 @@ async function joinThroughMatchmaker(gen, identity, gameId, lobby, Client, Callb
     startLocal(identity, 'Server unreachable - playing offline')
     return
   }
+  let lockedTries = 0
   for (let attempt = 0; ; attempt += 1) {
+    const lobbyNow = attempt === 0 ? lobby : { mode: 'public' }
     try {
       const { endpoint } = await sdk.net.resolveEndpoint(gameId)
       if (gen !== generation) return
-      const room = await join(new Client(endpoint), joinOptions(identity), attempt === 0 ? lobby : { mode: 'public' })
+      const room = await join(new Client(endpoint), joinOptions(identity), lobbyNow)
       if (gen !== generation) {
         room.leave(true)
         return
@@ -459,6 +509,15 @@ async function joinThroughMatchmaker(gen, identity, gameId, lobby, Client, Callb
     } catch (err) {
       if (gen !== generation) return
       console.warn('[net] matchmaker join failed', err)
+      const locked = lockedJoin(err, lobbyNow, lockedTries)
+      if (locked === 'retry') {
+        lockedTries += 1
+        attempt -= 1
+        await wait(LOCKED_RETRY_MS)
+        if (gen !== generation) return
+        continue
+      }
+      if (locked === 'fallback') continue
       if (performance.now() - started > MATCHMAKER_GIVE_UP_MS) break
       getGame().setNet({ mode: 'connecting', message: attempt === 0 ? 'Starting a server…' : 'Still connecting…' })
       await wait(MATCHMAKER_BACKOFF_MS[Math.min(attempt, MATCHMAKER_BACKOFF_MS.length - 1)])
@@ -466,6 +525,27 @@ async function joinThroughMatchmaker(gen, identity, gameId, lobby, Client, Callb
     }
   }
   startLocal(identity, 'Could not reach the game server - playing offline')
+}
+
+/**
+ * Travelling to another map (game/stageRuntime.js travelTo): offline, the local session
+ * moves to it; online, we leave this room and matchmake into one of that map (the join
+ * options carry the new `stage`).
+ */
+setServerStageSwitch((stageId) => {
+  if (active?.kind === 'local') active.local.switchStage(stageId)
+  else if (lastIdentity) startConnection(lastIdentity, { mode: 'public' })
+})
+
+/**
+ * Testing only (`?debug`: `__pp.unlockAll()`): opens every locked chapter - offline,
+ * in the local save. Online there is nothing to call: the server unlocks a chapter only
+ * at a finish it recorded. Returns whether it did anything.
+ */
+export function debugUnlockAll() {
+  if (active?.kind !== 'local') return false
+  active.local.unlockAll()
+  return true
 }
 
 /** Takes the game back after another window of the same account replaced this one. */

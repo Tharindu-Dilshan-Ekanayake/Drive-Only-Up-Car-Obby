@@ -1,65 +1,99 @@
 /**
- * Background music, made live with WebAudio like the sound effects: a bouncy game-day
- * loop for the stadium - a stomping kick drum and handclaps, ticking hats, a bass that
- * jumps octaves, punchy brass stabs and a chant-like hook over C - Am - F - G - kept
- * quiet under the game and the crowd.
+ * Background music, made live with WebAudio like the sound effects: a sunny harbour
+ * loop in F - a bouncy calypso bass, soft kick, shaker and claves, off-beat marimba
+ * chords, and a steel-drum melody over F - Dm - Bb - C. Every other time round the
+ * steel drum rests and the marimba plays a rippling arpeggio instead, so it doesn't nag.
+ *
+ * An optional intensity layer (setIntensity 0..1) adds 16th-note hats, a conga figure
+ * and a plucked chord arpeggio on its own bus, crossfaded in and out; weak devices
+ * (lite) never schedule it.
  *
  * Notes are scheduled a little ahead on the audio clock by a timer (the usual
- * look-ahead scheduler), never from the render loop.
+ * look-ahead scheduler), never from the render loop. Kept quiet under the engine.
  */
 
-const BPM = 112
+const BPM = 108
 const EIGHTH = 60 / BPM / 2
 const LOOKAHEAD_S = 0.35
 const TICK_MS = 100
 
-/** One chord per bar, as MIDI notes: bass root, then the stabs' three voices. */
+/** One chord per bar: bass root (MIDI) and the marimba's three voices. */
 const BARS = [
-  { root: 36, chord: [60, 64, 67] }, // C
-  { root: 33, chord: [60, 64, 69] }, // Am
-  { root: 41, chord: [60, 65, 69] }, // F
-  { root: 43, chord: [59, 62, 67] }, // G
+  { root: 41, chord: [65, 69, 72] }, // F
+  { root: 38, chord: [62, 65, 69] }, // Dm
+  { root: 34, chord: [62, 65, 70] }, // Bb
+  { root: 36, chord: [64, 67, 72] }, // C
 ]
-/** Where in each bar (eighths) the brass stabs hit: on the one, then pushed off the beat. */
-const STABS = [0, 3, 6]
-/** The hook, a 4-bar chant: [eighth within the 32, MIDI note, eighths long]. */
-const HOOK = [
-  [0, 72, 2],
-  [2, 72, 1],
-  [3, 74, 1],
-  [4, 76, 3],
-  [8, 76, 2],
-  [10, 74, 1],
-  [11, 72, 1],
-  [12, 69, 3],
-  [16, 69, 2],
-  [18, 72, 1],
-  [19, 74, 1],
-  [20, 77, 3],
-  [24, 76, 2],
-  [26, 74, 2],
-  [28, 71, 2],
-  [30, 74, 2],
+
+/** Bass per bar, in eighths: [eighth, semitones above the root]. Root, push, fifth, octave. */
+const BASS = [
+  [0, 0],
+  [3, 0],
+  [4, 7],
+  [6, 12],
+  [7, 7],
+]
+
+/** Marimba chord stabs on the off-beats. */
+const COMP = [1, 3, 5, 7]
+
+/** Claves in a 3-3-2 pattern. */
+const CLAVE = [0, 3, 6]
+
+/** The steel-drum melody, 4 bars: [eighth within the 32, MIDI note, length in eighths]. */
+const MELODY = [
+  [0, 72, 1],
+  [1, 74, 1],
+  [2, 77, 2],
+  [5, 76, 1],
+  [6, 74, 2],
+  [8, 72, 1],
+  [9, 69, 1],
+  [10, 74, 3],
+  [14, 72, 2],
+  [16, 70, 1],
+  [17, 72, 1],
+  [18, 74, 2],
+  [21, 72, 1],
+  [22, 70, 2],
+  [24, 67, 1],
+  [25, 69, 1],
+  [26, 72, 3],
+  [30, 76, 1],
+  [31, 77, 1],
 ]
 
 const freq = (midi) => 440 * 2 ** ((midi - 69) / 12)
 
-export function createMusic(ctx, destination, noiseBuffer) {
+/**
+ * @param {AudioContext} ctx
+ * @param {AudioNode} destination
+ * @param {AudioBuffer} noiseBuffer
+ * @param {() => boolean} [lite] true on weak devices: fewer voices per beat
+ */
+export function createMusic(ctx, destination, noiseBuffer, lite = () => false) {
   const out = ctx.createGain()
   out.gain.value = 0
   out.connect(destination)
-  // A low-pass over everything keeps it warm and out of the effects' way.
-  const tone = ctx.createBiquadFilter()
-  tone.type = 'lowpass'
-  tone.frequency.value = 3400
-  tone.connect(out)
+  // A gentle low-pass over everything keeps it warm and out of the effects' way.
+  const bus = ctx.createBiquadFilter()
+  bus.type = 'lowpass'
+  bus.frequency.value = 3600
+  bus.connect(out)
+  // The intensity layer's own fader, into the same warm bus.
+  const layer = ctx.createGain()
+  layer.gain.value = 0
+  layer.connect(bus)
+  let intensity = 0
+  /** Keep scheduling the layer until this audio time, so a fade-out isn't cut short. */
+  let layerUntil = 0
 
   let step = 0
   let nextAt = 0
   let timer = null
   const level = { base: 0.5, ducked: 1, volume: 1 }
 
-  function note(midi, t, { type = 'sine', length = 0.3, volume = 0.05, attack = 0.01, cutoff = 0 } = {}) {
+  function note(midi, t, { type = 'sine', length = 0.3, volume = 0.05, attack = 0.008, to = bus } = {}) {
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
     osc.type = type
@@ -67,20 +101,30 @@ export function createMusic(ctx, destination, noiseBuffer) {
     gain.gain.setValueAtTime(0.0001, t)
     gain.gain.exponentialRampToValueAtTime(volume, t + attack)
     gain.gain.exponentialRampToValueAtTime(0.0001, t + length)
-    if (cutoff) {
-      const filter = ctx.createBiquadFilter()
-      filter.type = 'lowpass'
-      filter.frequency.value = cutoff
-      osc.connect(filter).connect(gain).connect(tone)
-    } else {
-      osc.connect(gain).connect(tone)
-    }
+    osc.connect(gain).connect(to)
     osc.start(t)
     osc.stop(t + length + 0.05)
   }
 
-  /** Filtered noise: claps and hats. */
-  function hiss(t, { type = 'bandpass', frequency = 1500, q = 0.9, volume = 0.04, length = 0.06 } = {}) {
+  /**
+   * A steel drum: a bright fundamental with the pan's characteristic inharmonic
+   * overtones, all ringing down quickly.
+   */
+  function steel(midi, t, length) {
+    const ring = Math.max(0.35, length)
+    note(midi, t, { type: 'sine', length: ring, volume: 0.03 })
+    note(midi + 12, t, { type: 'sine', length: ring * 0.6, volume: 0.014 })
+    if (!lite()) note(midi + 19.02, t, { type: 'sine', length: ring * 0.3, volume: 0.007 })
+  }
+
+  /** A marimba: a woody sine blip plus a faint octave tick. */
+  function marimba(midi, t, volume = 0.02) {
+    note(midi, t, { type: 'sine', length: 0.22, volume, attack: 0.004 })
+    if (!lite()) note(midi + 24, t, { type: 'sine', length: 0.04, volume: volume * 0.4, attack: 0.002 })
+  }
+
+  /** Filtered noise: shakers and the clap. */
+  function hiss(t, { type = 'highpass', frequency = 6000, q = 0.7, volume = 0.01, length = 0.05, to = bus } = {}) {
     const src = ctx.createBufferSource()
     src.buffer = noiseBuffer
     const filter = ctx.createBiquadFilter()
@@ -90,51 +134,88 @@ export function createMusic(ctx, destination, noiseBuffer) {
     const gain = ctx.createGain()
     gain.gain.setValueAtTime(volume, t)
     gain.gain.exponentialRampToValueAtTime(0.0001, t + length)
-    src.connect(filter).connect(gain).connect(tone)
+    src.connect(filter).connect(gain).connect(to)
     src.start(t, Math.random() * 0.5)
     src.stop(t + length + 0.01)
   }
 
-  /** A stomping kick drum: a sine dropping fast. */
-  function drum(t, volume = 0.16) {
+  /** A conga: a short sine with a quick pitch drop. */
+  function conga(t, from, volume) {
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
-    osc.frequency.setValueAtTime(150, t)
-    osc.frequency.exponentialRampToValueAtTime(45, t + 0.12)
+    osc.frequency.setValueAtTime(from, t)
+    osc.frequency.exponentialRampToValueAtTime(from * 0.7, t + 0.08)
     gain.gain.setValueAtTime(volume, t)
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.2)
-    osc.connect(gain).connect(tone)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14)
+    osc.connect(gain).connect(layer)
     osc.start(t)
-    osc.stop(t + 0.22)
+    osc.stop(t + 0.16)
   }
 
-  /** A handclap: a few bursts a hair apart, like a crowd of hands. */
-  function clap(t) {
-    for (let i = 0; i < 3; i += 1) hiss(t + i * 0.011, { frequency: 1300 + i * 250, volume: 0.035, length: 0.05 + i * 0.02 })
+  /** The intensity layer for eighth `inBar` of `bar`: hats on 16ths, congas, a 16th arpeggio. */
+  function playLayer(t, inBar, bar) {
+    if (lite() || (intensity < 0.02 && t > layerUntil)) return
+    const half = EIGHTH / 2
+    hiss(t, { frequency: 8000, volume: 0.006, length: 0.03, to: layer })
+    hiss(t + half, { frequency: 8000, volume: 0.0035, length: 0.025, to: layer })
+    if (inBar === 2 || inBar === 3) conga(t + half, 330, 0.035)
+    if (inBar === 6) conga(t, 240, 0.04)
+    if (inBar === 7) conga(t, 200, 0.04)
+    const a = bar.chord[(inBar * 2) % 3] + 12
+    const b = bar.chord[(inBar * 2 + 1) % 3] + (inBar >= 4 ? 24 : 12)
+    note(a, t, { type: 'triangle', length: 0.11, volume: 0.009, attack: 0.003, to: layer })
+    note(b, t + half, { type: 'triangle', length: 0.1, volume: 0.007, attack: 0.003, to: layer })
   }
 
-  /** Everything that sounds on eighth `step` (of a 4-bar, 32-eighth loop) at time t. */
+  /** A soft kick: a sine dropping fast. */
+  function kick(t, volume = 0.1) {
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.frequency.setValueAtTime(120, t)
+    osc.frequency.exponentialRampToValueAtTime(45, t + 0.1)
+    gain.gain.setValueAtTime(volume, t)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18)
+    osc.connect(gain).connect(bus)
+    osc.start(t)
+    osc.stop(t + 0.2)
+  }
+
+  /** A wooden clave click. */
+  function clave(t) {
+    note(91, t, { type: 'triangle', length: 0.05, volume: 0.012, attack: 0.002 })
+  }
+
+  /** Everything that sounds on eighth `step` (of a 64-eighth, two-pass loop) at time t. */
   function play(t) {
     const inBar = step % 8
-    const barIndex = Math.floor(step / 8) % BARS.length
-    const bar = BARS[barIndex]
-    // Drums: kick on 1 and 3 (and a double at the end of the loop), claps on 2 and 4,
-    // hats on every off-beat.
-    if (inBar === 0 || inBar === 4 || (barIndex === 3 && inBar === 7)) drum(t)
-    if (inBar === 2 || inBar === 6) clap(t)
-    if (inBar % 2 === 1) hiss(t, { type: 'bandpass', frequency: 5200, q: 1.2, volume: 0.006, length: 0.018 })
-    // Bass: the root, jumping an octave every other eighth.
-    note(bar.root + (inBar % 2 ? 12 : 0), t, { type: 'triangle', length: EIGHTH * 0.9, volume: 0.07 })
-    // Brass: short, bright stabs of the chord.
-    if (STABS.includes(inBar)) {
-      for (const n of bar.chord) note(n, t, { type: 'sawtooth', length: 0.17, volume: 0.011, attack: 0.012, cutoff: 1900 })
+    const bar = BARS[Math.floor(step / 8) % BARS.length]
+    const pass = Math.floor(step / 32) % 2
+
+    if (inBar === 0 || inBar === 4) kick(t)
+    if (inBar === 4) hiss(t, { type: 'bandpass', frequency: 1600, q: 0.9, volume: 0.02, length: 0.06 })
+    hiss(t, { volume: inBar % 2 ? 0.008 : 0.004, length: 0.035 })
+    if (CLAVE.includes(inBar)) clave(t)
+
+    for (const [at, interval] of BASS) {
+      if (at === inBar) note(bar.root + interval, t, { type: 'triangle', length: EIGHTH * 0.85, volume: 0.075 })
     }
-    // The hook, on a soft square lead (every other time round, so it doesn't nag).
-    if (Math.floor(step / 32) % 2 === 0) {
-      for (const [at, midi, length] of HOOK) {
-        if (at === step % 32) note(midi, t, { type: 'square', length: EIGHTH * length * 0.9, volume: 0.014, attack: 0.02, cutoff: 2200 })
+
+    if (COMP.includes(inBar)) {
+      const voices = lite() ? bar.chord.slice(0, 2) : bar.chord
+      for (const n of voices) marimba(n, t, 0.012)
+    }
+
+    if (pass === 0) {
+      for (const [at, midi, length] of MELODY) {
+        if (at === step % 32) steel(midi, t, EIGHTH * length)
       }
+    } else {
+      // The answer: the chord rippled up on the marimba, an octave higher.
+      const n = bar.chord[inBar % 3] + 12 + (inBar >= 6 ? 12 : 0)
+      if (inBar % 2 === 0) marimba(n, t, 0.018)
     }
+
+    playLayer(t, inBar, bar)
   }
 
   function schedule() {
@@ -156,18 +237,27 @@ export function createMusic(ctx, destination, noiseBuffer) {
       nextAt = ctx.currentTime + 0.1
       timer = setInterval(schedule, TICK_MS)
       schedule()
-      // Fade in.
       applyLevel(1.2)
     },
-    /** Quieter while something else should be heard (the rush of a flying ball). */
+    /** Quieter while something else should be heard (a fanfare, a big reveal). */
     duck(on) {
-      level.ducked = on ? 0.45 : 1
-      applyLevel(0.4)
+      level.ducked = on ? 0.4 : 1
+      applyLevel(0.3)
+    },
+    /**
+     * Intensity 0..1: crossfades the extra layer in (or out) over about a second.
+     * Ignores changes under 0.02, so it can be called every frame.
+     */
+    setIntensity(value) {
+      const v = Math.min(1, Math.max(0, Number(value) || 0))
+      if (Math.abs(v - intensity) < 0.02 && !(v === 0 && intensity !== 0)) return
+      if (v < 0.02 && intensity >= 0.02) layerUntil = ctx.currentTime + 3
+      intensity = v
+      layer.gain.setTargetAtTime(v, ctx.currentTime, 0.7)
     },
     /** The player's music volume, 0..1 (Boxity's music_volume setting). */
     setVolume(volume) {
       level.volume = Math.min(1, Math.max(0, Number(volume) || 0))
-      // Before start() the fade-in will pick it up.
       if (timer) applyLevel(0.15)
     },
   }

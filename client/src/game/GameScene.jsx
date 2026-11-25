@@ -8,42 +8,64 @@ import { useBloxityStore } from '../bloxity/store'
 import { useGame } from '../store/game'
 import { RENDER_SCALES, useQuality } from '../store/quality'
 import ErrorBoundary from '../ui/ErrorBoundary'
-import BlobShadows from './BlobShadows'
-import FollowCamera from './FollowCamera'
-import GainFX from './fx/GainFX'
-import WorldLabels from './labels/WorldLabels'
-import { prepareAudio } from '../audio/sfx'
-import { queueAllPetIcons } from './pets/petIcons'
-import Pets, { RewardCrab, SphinxShowcase } from './pets/Pets'
-import RemoteAvatars from './remote/RemoteAvatars'
-import RemotePlayers from './remote/RemotePlayers'
+import ChaseCamera from './camera/ChaseCamera'
+import { attachIconRenderer, processIconQueue } from './cars/carIcons'
+import { wheelBatch } from './cars/CarRig'
+import { iconGate } from './iconGate'
+import CarFx from './fx/CarFx'
+import NightLights from './fx/NightLights'
+import { carLights } from './fx/carLights'
 import Particles from './fx/Particles'
-import Leaderboards from './world/Leaderboards'
-import TireShop from './world/TireShop'
-import EggDisplays from './world/EggDisplays'
-import Portal from './world/Portal'
-import SecretStar from './world/SecretStar'
-import TutorialArrows from './world/TutorialArrows'
-import Lighting from './Lighting'
+import Ghost from './ghost/Ghost'
+import SkidMarks from './fx/SkidMarks'
+import { SKY_THEMES } from './palette'
 import PerfProbe from './PerfProbe'
-import Player from './Player'
+import PlayerCar from './player/PlayerCar'
+import RemoteCars from './remote/RemoteCars'
 import ShaderWarmup from './ShaderWarmup'
-import { FOG, SKY } from './sceneStyle'
-import Sky from './Sky'
-import World from './world/World'
-import LaunchReach from './world/LaunchReach'
-import { showLobbySky } from './worldLook'
+import StageWarmup, { LobbyWarmup, WarmHold } from './StageWarmup'
+import StartGateBar from './world/StartGateBar'
+import { stageInfo } from '@shared/stages/index'
+
+import { loadCurrentStage } from './stageRuntime'
+import Environment from './world/Environment'
+import Harbour from './world/Harbour'
+import Lobby from './world/Lobby'
+import { useSkyTheme } from './world/skyTheme'
+import { preloadScenery } from './world/scenery/index'
+import Seagulls from './world/Seagulls'
 
 // r3f-perf is a dev-only overlay (?perf in the URL). The DEV check is static, so the
 // import and the package are dropped from production builds entirely.
-const DevPerf = import.meta.env.DEV
-  ? lazy(() => import('r3f-perf').then((m) => ({ default: m.Perf })))
-  : null
+const DevPerf = import.meta.env.DEV ? lazy(() => import('r3f-perf').then((m) => ({ default: m.Perf }))) : null
 const showDevPerf = import.meta.env.DEV && new URLSearchParams(window.location.search).has('perf')
 
-// The runway is its own chunk, fetched once the lobby is on screen so it never delays
-// time-to-playable.
-const Roll = lazy(() => import('./roll/Roll'))
+// The map's stage world (track, boards, CPU racers, scenery) is its own chunk, and the
+// map's stage data another (shared/stages/index.js). The loading screen goes as soon as
+// the LOBBY is built and warmed (LobbyWarmup); the current map is then prepared in the
+// background while you drive round the pier - stage data and heavy geometry in the prep
+// worker (game/prep), the stage world mounted a part per frame, warmed on the GPU in small
+// batches (StageWarmup) - and the Start gate opens once it's all done, so neither the lobby
+// nor the track ever stalls. Keyed by map: travelling unmounts (and disposes) the old one.
+const loadStageWorld = () => import('./track/StageWorld')
+const StageWorld = lazy(loadStageWorld)
+// The Rocket Missile system (its own small chunk, fetched once the lobby is up; items fire through game/fx/missileHub.js).
+const MissileFx = lazy(() => import('./fx/MissileFx'))
+
+/** Prepares the current map in the background whenever there's a map without one (start-up once the lobby is up, travel). */
+function StageLoader() {
+  const stageId = useGame((s) => s.stageId)
+  const loaded = useGame((s) => Boolean(s.stage))
+  useEffect(() => {
+    if (!loaded) loadCurrentStage()
+  }, [stageId, loaded])
+  // The map's code chunks, fetched in parallel with its stage data (not one after another).
+  useEffect(() => {
+    loadStageWorld().catch(() => null)
+    preloadScenery(stageInfo(stageId)?.theme?.scenery)
+  }, [stageId])
+  return null
+}
 
 /**
  * Fires `onFirstFrame` after the renderer has actually drawn once.
@@ -55,21 +77,8 @@ function FirstFrameSignal({ onFirstFrame }) {
     if (fired.current) return
     fired.current = true
     performance.mark('pp:first-frame')
-    // Deferred: never update React state from inside the frame loop.
     setTimeout(onFirstFrame, 0)
   })
-  return null
-}
-
-/**
- * The world you're in: its lobby sky (and fog) now, and a track rebuilt with its stages
- * (Roll is keyed on it).
- */
-function WorldSky({ world }) {
-  const scene = useThree((s) => s.scene)
-  useEffect(() => {
-    showLobbySky(scene.fog)
-  }, [world, scene])
   return null
 }
 
@@ -84,29 +93,13 @@ function ViewDistance({ far }) {
   return null
 }
 
-/**
- * The camera's vertical field of view for a screen `aspect` wide: 60 degrees on a
- * landscape screen; wider on one held upright, so the runway, the pull-up bars and the arms
- * still fit across a phone in portrait instead of being cropped to a narrow slit.
- */
-const fovForAspect = (aspect) => (aspect >= 1 ? 60 : Math.min(84, 60 / Math.sqrt(Math.max(0.3, aspect))))
-
-/**
- * Keeps the field of view right for the screen's shape as the phone turns. Left alone
- * while you fly (Roll.jsx animates the lens then, from this as its base), and put
- * right again once the launch is over.
- */
-function AspectFov() {
-  const get = useThree((s) => s.get)
-  const width = useThree((s) => s.size.width)
-  const height = useThree((s) => s.size.height)
-  const rolling = useGame((s) => Boolean(s.roll))
-  useEffect(() => {
-    if (rolling) return
-    const { camera } = get()
-    camera.fov = fovForAspect(width / Math.max(1, height))
-    camera.updateProjectionMatrix()
-  }, [get, width, height, rolling])
+/** Start of every frame (before any car is posed): resets the shared wheel and night-light batches, renders queued car icons. */
+function FrameStart() {
+  useFrame(() => {
+    wheelBatch.begin()
+    carLights.begin()
+    if (iconGate.open) processIconQueue()
+  }, -1)
   return null
 }
 
@@ -114,29 +107,32 @@ function AspectFov() {
  * The 3D view. Owns the renderer lifecycle: quality-driven settings, automatic preset
  * drops when FPS falls under budget, and recovery from a lost WebGL context.
  *
- * @param {{ onReady?: () => void }} props called once the avatar is in and a frame
- *   has been drawn
+ * @param {{ onReady?: () => void, onPierDrawn?: () => void }} props `onReady`: called once
+ *   the lobby is drawn and readied (LobbyWarmup) - the map is then prepared in the background;
+ *   `onPierDrawn`: the pier's first frame is drawn
  */
-export function GameScene({ onReady }) {
+export function GameScene({ onReady, onPierDrawn }) {
   const { game } = useBloxity()
   const settings = useQuality((s) => s.settings)
+  const sky = useSkyTheme()
   const antialias = useQuality((s) => s.antialias)
-  // A level picked in Settings rebuilds the whole 3D view with it.
   const rebuild = useQuality((s) => s.rebuild)
   const degrade = useQuality((s) => s.degrade)
   const recover = useQuality((s) => s.recover)
   const renderScale = useQuality((s) => RENDER_SCALES[s.renderStep])
-  // Boxity ad break: nothing renders until it's over.
   const adBreak = useBloxityStore((s) => s.adBreak)
-  const world = useGame((s) => s.profile.world)
+  const stage = useGame((s) => s.stage)
+  // The loading screen is gone (App): only then does the background map prep start, so it
+  // doesn't compete with the lobby's last steps under the screen.
+  const playable = useGame((s) => s.playable)
 
   const [warmedUp, setWarmedUp] = useState(false)
   const [firstFrame, setFirstFrame] = useState(false)
+  const [lobbyWarm, setLobbyWarm] = useState(false)
+  const [lobbyReady, setLobbyReady] = useState(false)
   const [contextKey, setContextKey] = useState(0)
   const [contextLost, setContextLost] = useState(false)
-  /** The last rebuild (see quality.js) whose shaders have warmed up. */
   const [warmedRebuild, setWarmedRebuild] = useState(0)
-  // Rebuilt for a new graphics level, still compiling: a cover instead of an empty sky.
   const rebuilding = rebuild !== warmedRebuild
   const readySent = useRef(false)
 
@@ -145,39 +141,32 @@ export function GameScene({ onReady }) {
     setWarmedRebuild(useQuality.getState().rebuild)
   }, [])
   const handleFirstFrame = useCallback(() => setFirstFrame(true), [])
+  const handleLobbyWarm = useCallback(() => setLobbyWarm(true), [])
 
   useEffect(() => {
-    game.loadingStep('Preparing scene…')
+    game.loadingStep('Preparing the docks…')
   }, [game])
 
-  // Playable once every shader is compiled and the first real frame is drawn. The
-  // player's own avatar streams in afterwards (a blocky stand-in shows meanwhile), so a
-  // slow avatar CDN never holds the game up.
   useEffect(() => {
-    if (!warmedUp || !firstFrame || readySent.current) return
+    if (warmedUp && firstFrame) onPierDrawn?.()
+  }, [warmedUp, firstFrame, onPierDrawn])
+
+  useEffect(() => {
+    if (!warmedUp || !firstFrame || !lobbyWarm || readySent.current) return
     readySent.current = true
     performance.mark('pp:ready')
     game.loadingEnd()
+    setLobbyReady(true)
     onReady?.()
-    // Nothing on screen needs these yet, so they wait until the game is up: the pet
-    // portraits (made one a frame, read back asynchronously) and, at the first idle
-    // moment, the audio engine - built on the first tap instead it froze that tap, and a
-    // tap that beats it there still builds it (sfx.unlock). Before, both ran behind the
-    // loading screen: ~0.9 s of a slow phone's start-up.
-    queueAllPetIcons()
-    if ('requestIdleCallback' in window) requestIdleCallback(prepareAudio, { timeout: 1500 })
-    else setTimeout(prepareAudio, 200)
-  }, [warmedUp, firstFrame, game, onReady])
+  }, [warmedUp, firstFrame, lobbyWarm, game, onReady])
 
   // A lost context (GPU reset, too many tabs, backgrounded on mobile) is recovered by
   // remounting the canvas, which builds a fresh context and re-uploads everything.
-  // Game state lives in stores, so nothing is lost but a moment of rendering.
   const handleCreated = useCallback(({ gl }) => {
     performance.mark('pp:gl-created')
-    gl.setClearColor(SKY.horizon)
-    // Checking every program's compile status forces the driver to finish it on the
-    // spot. Worth it while developing; in production it only costs start-up time.
+    gl.setClearColor(SKY_THEMES.golden.fog)
     gl.debug.checkShaderErrors = import.meta.env.DEV
+    attachIconRenderer(gl)
     const canvas = gl.domElement
     let remountTimer = null
     const remount = () => {
@@ -186,37 +175,23 @@ export function GameScene({ onReady }) {
       setContextKey((k) => k + 1)
     }
     canvas.addEventListener('webglcontextlost', (e) => {
-      // A canvas already taken off the page was replaced on purpose (a new graphics
-      // level), and losing its context is how it's cleaned up: nothing to recover.
       if (!canvas.isConnected) return
       e.preventDefault()
       setContextLost(true)
-      // Don't wait forever for a 'restored' that may never come.
       remountTimer = setTimeout(remount, 1500)
     })
     canvas.addEventListener('webglcontextrestored', remount)
   }, [])
 
-  // Never set state from the monitor's frame callback directly.
   const handleDecline = useCallback(() => setTimeout(degrade, 0), [degrade])
   const handleIncline = useCallback(() => setTimeout(recover, 0), [recover])
 
   const dpr = Math.min(settings.dpr, window.devicePixelRatio || 1) * renderScale
 
-  // The renderer is built here rather than by R3F so its creation (the WebGL context,
-  // often the slowest single step of start-up) is measured, and so the canvas is opaque:
-  // the sky covers it anyway, and an opaque canvas is cheaper for the browser to
-  // composite.
   const createRenderer = useMemo(
     () => (defaults) => {
       performance.mark('pp:gl-start')
-      const renderer = new WebGLRenderer({
-        ...defaults,
-        alpha: false,
-        antialias,
-        stencil: false,
-        powerPreference: 'high-performance',
-      })
+      const renderer = new WebGLRenderer({ ...defaults, alpha: false, antialias, stencil: false, powerPreference: 'high-performance' })
       performance.mark('pp:gl-end')
       return renderer
     },
@@ -230,50 +205,44 @@ export function GameScene({ onReady }) {
         frameloop={adBreak ? 'never' : 'always'}
         dpr={dpr}
         gl={createRenderer}
-        // PCF, not R3F's default "soft": three r18x removed PCFSoftShadowMap.
         shadows={settings.shadows === 'realtime' ? 'percentage' : false}
-        // No tone mapping. The default (ACES) desaturates the toy colours; the palette
-        // and light levels in sceneStyle.js are chosen to look right without it.
+        // No tone mapping: the palette is chosen to look right as-is.
         flat
-        camera={{ position: [0, 6, 26], fov: 60, near: 0.5, far: settings.viewDistance }}
+        camera={{ position: [0, 8, 34], fov: 62, near: 0.3, far: settings.viewDistance }}
         onCreated={handleCreated}
       >
-        <fog attach="fog" args={[FOG.color, settings.fogNear, settings.viewDistance * 0.95]} />
+        <fog attach="fog" args={[sky.fog, settings.fogNear, settings.viewDistance * 0.95]} />
         <ViewDistance far={settings.viewDistance} />
-        <AspectFov />
-        {/* Under 45 FPS: shed load (quality.degrade). Back over 58 with room to spare:
-            resolution comes back (quality.recover). After a few flips back and forth it
-            settles where it is rather than see-sawing. */}
         <PerformanceMonitor bounds={() => [45, 58]} flipflops={4} onDecline={handleDecline} onIncline={handleIncline} />
 
-        <Sky />
-        <WorldSky world={world} />
-        <Lighting />
-        <World />
-        <LaunchReach />
-        <WorldLabels />
-        <TireShop />
-        <EggDisplays />
-        <SecretStar />
-        <Portal />
-        <Leaderboards />
-        <TutorialArrows />
+        <FrameStart />
+        <Environment />
+        <Lobby />
+        <Harbour />
+        <Seagulls />
+        <PlayerCar />
+        <Ghost />
+        <RemoteCars />
+        <CarFx />
+        <NightLights />
         <Particles />
-        <SphinxShowcase />
-        <RewardCrab />
-        <Pets />
-        <RemotePlayers />
-        <RemoteAvatars />
-        <Player />
-        <BlobShadows />
-        <GainFX />
-        {warmedUp && firstFrame && (
+        <SkidMarks />
+        {lobbyReady && playable && <StageLoader />}
+        {lobbyReady && playable && (
           <Suspense fallback={null}>
-            <Roll key={world} />
+            <MissileFx />
           </Suspense>
         )}
+        {lobbyReady && playable && stage && (
+          <Suspense fallback={<WarmHold />}>
+            <StageWorld key={stage.id} stage={stage} />
+          </Suspense>
+        )}
+        {warmedUp && firstFrame && <LobbyWarmup onDone={handleLobbyWarm} />}
+        {lobbyReady && playable && <StageWarmup />}
+        <StartGateBar />
 
-        <FollowCamera />
+        <ChaseCamera />
         <ShaderWarmup onDone={handleWarmedUp} />
         {warmedUp && <FirstFrameSignal onFirstFrame={handleFirstFrame} />}
         <PerfProbe />

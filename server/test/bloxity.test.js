@@ -1,25 +1,22 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 
-import { createProfile } from '../../shared/logic.js'
-import { PlayerSession } from '../../shared/session.js'
+import { createProfile, progressFor } from '../../shared/logic.js'
+import { loadStage } from '../../shared/stages/index.js'
 import { asGuestId, resolveIdentity, verifyAdReward } from '../src/bloxityApi.js'
 import { readBloxityEnv } from '../src/bloxityEnv.js'
 import { BLOXITY_LEADERBOARDS, changedScores, chunk, leaderboardScores, sendScores } from '../src/bloxityLeaderboards.js'
 import {
   carryOverGuest,
-  claimGemGrant,
   closeStorage,
   loadProfile,
   openStorage,
-  pendingGemGrants,
-  recordGemGrant,
-  releaseGemGrant,
   saveProfile,
   topPlayers,
+  topSplits,
 } from '../src/db.js'
-import { applyGemsFor, gemsWebhook, parseGemWebhook, profileIdOf, webhookSecretOk } from '../src/gems.js'
-import { activePlayers } from '../src/registry.js'
+
+const STAGE1 = await loadStage('sky-docks')
 
 /**
  * A stand-in for fetch: answers each call with `reply(url, init)` -> `{ status, body }`
@@ -47,7 +44,7 @@ test('Boxity URLs come from the environment, production only as the fallback', (
   assert.equal(local.matchmakerUrl, 'https://play.bloxity.io')
   assert.equal(local.portalUrl, 'https://bloxity.io')
   assert.equal(local.staticUrl, 'https://static.bloxity.io')
-  assert.equal(local.gameSlug, '1-arm-length')
+  assert.equal(local.gameSlug, 'drive-only-up-car-obby')
   assert.equal(local.hosted, false)
   assert.equal(hosted.apiUrl, 'https://api.stage.example', 'trailing slash trimmed')
   assert.equal(hosted.gameSlug, 'tire')
@@ -111,9 +108,9 @@ test('an ad pays only when Boxity says the token is valid', async () => {
 
 test('leaderboard scores are whole numbers from the profile', () => {
   const p = createProfile('a', 'A')
-  Object.assign(p, { rebirths: 3 })
-  Object.assign(p.stats, { totalWins: 1234.6, bestDistance: 569.9, playtime: 3599 })
-  assert.deepEqual(leaderboardScores(p), { rebirths: 3, wins: 1234, distance: 569, playtime: 59 })
+  progressFor(p, STAGE1).best.altitude = 282.9
+  Object.assign(p.stats, { totalCoins: 1234, finishes: 3, playtime: 3599 })
+  assert.deepEqual(leaderboardScores(p), { altitude: 282, coins: 1234, finishes: 3, playtime: 59 })
   assert.deepEqual(
     BLOXITY_LEADERBOARDS.map((b) => b.id),
     Object.keys(leaderboardScores(p)),
@@ -122,11 +119,11 @@ test('leaderboard scores are whole numbers from the profile', () => {
 
 test('only changed scores are reported, as legion_<id>', () => {
   const p = createProfile('a', 'A')
-  p.rebirths = 2
+  p.stats.finishes = 2
   const lastSent = new Map([
-    ['legion_a|rebirths', 2],
-    ['legion_a|wins', 0],
-    ['legion_a|distance', 0],
+    ['legion_a|altitude', 0],
+    ['legion_a|coins', 0],
+    ['legion_a|finishes', 2],
   ])
   assert.deepEqual(changedScores([{ id: 'a', profile: p }], lastSent), [{ board: 'playtime', userId: 'legion_a', score: 0 }])
   assert.deepEqual(
@@ -136,11 +133,11 @@ test('only changed scores are reported, as legion_<id>', () => {
 })
 
 test('reports go in batches of 200; failed batches are retried later', async () => {
-  const scores = Array.from({ length: 450 }, (_, i) => ({ board: 'wins', userId: `legion_${i}`, score: i }))
+  const scores = Array.from({ length: 450 }, (_, i) => ({ board: 'coins', userId: `legion_${i}`, score: i }))
   let n = 0
   const fetchImpl = fakeFetch(() => {
     n += 1
-    return n === 2 ? { status: 500 } : { body: { accepted: 1, dropped: { wins: 0 } } }
+    return n === 2 ? { status: 500 } : { body: { accepted: 1, dropped: { coins: 0 } } }
   })
   const lastSent = new Map()
   await sendScores(scores, lastSent, { token: 'rt', settings: hosted, fetchImpl })
@@ -152,26 +149,7 @@ test('reports go in batches of 200; failed batches are retried later', async () 
   assert.equal(fetchImpl.calls[0].init.headers.Authorization, 'Bearer rt')
   assert.deepEqual(fetchImpl.calls[0].body.boards, BLOXITY_LEADERBOARDS)
   assert.equal(lastSent.size, 250, 'the failed batch is not marked as sent')
-  assert.equal(lastSent.has('legion_250|wins'), false)
-})
-
-// --- Gems webhook ----------------------------------------------------------------
-
-test('the webhook secret must match exactly when one is set', () => {
-  assert.equal(webhookSecretOk(undefined, ''), true)
-  assert.equal(webhookSecretOk('s3cret', 's3cret'), true)
-  assert.equal(webhookSecretOk('s3cre', 's3cret'), false)
-  assert.equal(webhookSecretOk(undefined, 's3cret'), false)
-})
-
-test('webhook bodies are checked: known sku, ids, legion_ prefix stripped', () => {
-  const ok = parseGemWebhook({ transactionId: 't1', userId: 'legion_acc1', sku: 'wins_small', productPrice: 50 })
-  assert.equal(ok.ok, true)
-  assert.equal(ok.grant.userId, 'acc1')
-  assert.equal(profileIdOf('acc2'), 'acc2')
-  assert.equal(parseGemWebhook({ transactionId: 't1', userId: 'acc1', sku: 'nope' }).status, 400)
-  assert.equal(parseGemWebhook({ userId: 'acc1', sku: 'wins_small' }).status, 400)
-  assert.equal(parseGemWebhook(null).ok, false)
+  assert.equal(lastSent.has('legion_250|coins'), false)
 })
 
 // --- Database (SQLite in memory) -------------------------------------------------
@@ -179,79 +157,50 @@ test('webhook bodies are checked: known sku, ids, legion_ prefix stripped', () =
 before(() => openStorage({ path: ':memory:' }))
 after(() => closeStorage())
 
-test('a Gems grant is recorded once and claimed once', async () => {
-  const grant = { transactionId: 'txn-1', userId: 'acc1', sku: 'wins_small' }
-  assert.equal(await recordGemGrant(grant), true)
-  assert.equal(await recordGemGrant(grant), false, 'a repeated webhook is a no-op')
-  assert.deepEqual(await pendingGemGrants(['acc1', 'other']), [grant])
-  assert.equal(await claimGemGrant('txn-1', 'pod-a'), true)
-  assert.equal(await claimGemGrant('txn-1', 'pod-b'), false)
-  assert.deepEqual(await pendingGemGrants(['acc1']), [])
-  await releaseGemGrant('txn-1', 'pod-b')
-  assert.deepEqual(await pendingGemGrants(['acc1']), [], 'only the claimer can release')
-  await releaseGemGrant('txn-1', 'pod-a')
-  assert.equal(await claimGemGrant('txn-1', 'pod-b'), true)
-})
-
-test('the webhook route records grants and answers fast', async () => {
-  const call = async (body, secret) => {
-    const res = { code: 200, status(c) { this.code = c; return this }, json(b) { this.body = b; return this } }
-    await gemsWebhook({ body, get: () => secret }, res)
-    return res.code
-  }
-  process.env.LEGION_WEBHOOK_SECRET = 'hook'
-  try {
-    const body = { transactionId: 'txn-w', userId: 'legion_acc9', sku: 'potion_bundle' }
-    assert.equal(await call(body, 'wrong'), 401)
-    assert.equal(await call(body, 'hook'), 200)
-    assert.equal(await call(body, 'hook'), 200, 'duplicates are fine')
-    assert.equal(await call({ ...body, transactionId: 'txn-x', sku: 'nope' }, 'hook'), 400)
-    assert.deepEqual(await pendingGemGrants(['acc9']), [{ transactionId: 'txn-w', userId: 'acc9', sku: 'potion_bundle' }])
-  } finally {
-    delete process.env.LEGION_WEBHOOK_SECRET
-  }
-})
-
-test('a pod applies grants to the verified players it holds, exactly once', async () => {
-  const profile = createProfile('acc5', 'Five')
-  const session = new PlayerSession(profile, { now: 0, emit: () => {}, getPosition: () => ({ x: 0, z: 0 }) })
-  const member = { session, playerId: 'acc5', verified: true, owner: 'test' }
-  const room = { members: new Map([['s5', member]]), syncPlayer: () => {} }
-  activePlayers.set('acc5', { room, client: { sessionId: 's5' } })
-  try {
-    await recordGemGrant({ transactionId: 'txn-5', userId: 'acc5', sku: 'health_x2' })
-    await Promise.all([applyGemsFor(['acc5']), applyGemsFor(['acc5'])])
-    assert.equal(profile.passes.healthX2, true)
-    assert.equal(profile.wins, 0, 'applied once, not turned into Wins by a second copy')
-    assert.equal((await loadProfile('acc5', 'Five', 'test')).passes.healthX2, true, 'saved')
-    assert.deepEqual(await pendingGemGrants(['acc5']), [])
-  } finally {
-    activePlayers.delete('acc5')
-  }
-})
-
 test('guest progress carries into a new account once', async () => {
   const guest = createProfile('guest-g1', 'Guesty')
-  guest.wins = 777
-  guest.rebirths = 2
+  guest.coins = 777
+  guest.stats.finishes = 2
   await saveProfile(guest, 'x')
   assert.equal(await carryOverGuest('acc7', ['nope', 'g1'], 'Seven'), 'guest-g1', 'found under its guest- spelling')
   const carried = await loadProfile('acc7', 'Seven', 'x')
   assert.equal(carried.id, 'acc7')
   assert.equal(carried.name, 'Seven')
-  assert.equal(carried.wins, 777)
-  assert.equal(carried.rebirths, 2)
+  assert.equal(carried.coins, 777)
+  assert.equal(carried.stats.finishes, 2)
   assert.equal(await carryOverGuest('acc8', ['guest-g1'], 'Eight'), null, 'never copied twice')
   assert.equal(await carryOverGuest('acc7', ['guest-g1'], 'Seven'), null)
   const boards = await topPlayers(10)
-  assert.equal(boards.rebirths.filter((r) => r.value === 2).length, 1, 'the used guest save is off the boards')
+  assert.equal(boards.finishes.filter((r) => r.score === 2).length, 1, 'the used guest save is off the boards')
 
   // An account that already has progress keeps it.
   const other = createProfile('guest-g2', 'G2')
-  other.wins = 5
+  other.coins = 5
   await saveProfile(other, 'x')
   assert.equal(await carryOverGuest('acc7', ['guest-g2'], 'Seven'), null)
   assert.equal(await carryOverGuest('acc10', ['guest-g2'], 'Ten'), 'guest-g2', 'still unused, so still available')
+})
+
+test('checkpoint boards list the fastest best splits, and carried guest times move', async () => {
+  const a = createProfile('split-a', 'Alpha')
+  progressFor(a, STAGE1).splits = { 1: 30000, 2: 52000 }
+  const b = createProfile('guest-split-b', 'Bravo')
+  progressFor(b, STAGE1).splits = { 1: 25000 }
+  await saveProfile(a, 'x')
+  await saveProfile(b, 'x')
+  a.maps['sky-docks'].splits[1] = 28000
+  await saveProfile(a, 'x')
+  let boards = await topSplits(10, 'sky-docks', 3)
+  assert.deepEqual(boards[1].filter((r) => r.name === 'Alpha' || r.name === 'Bravo'), [
+    { name: 'Bravo', ms: 25000 },
+    { name: 'Alpha', ms: 28000 },
+  ])
+  assert.deepEqual(boards[2].filter((r) => r.name === 'Alpha'), [{ name: 'Alpha', ms: 52000 }])
+  assert.deepEqual(boards[3], [])
+  assert.equal(await carryOverGuest('acc-split', ['guest-split-b'], 'Charlie'), 'guest-split-b')
+  boards = await topSplits(10, 'sky-docks', 1)
+  const names = boards[1].map((r) => r.name)
+  assert.ok(names.includes('Charlie') && !names.includes('Bravo'), 'the guest time moved to the account')
 })
 
 // --- Open Rooms reporter -----------------------------------------------------------

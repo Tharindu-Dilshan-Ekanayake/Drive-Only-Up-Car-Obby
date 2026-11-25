@@ -39,8 +39,6 @@ export const useBloxityStore = create((set) => ({
    * pauses rendering and the audio is muted for it.
    */
   adBreak: false,
-  /** The signed-in player's Gems balance; null when unknown (guest, offline, loading). */
-  gems: null,
   /** Boxity friends of the signed-in player (`social.getFriends()`); [] for guests. */
   friends: [],
 
@@ -59,7 +57,6 @@ export const useBloxityStore = create((set) => ({
   setProportions: (proportions) =>
     set({ proportions: { ...DEFAULT_PROPORTIONS, ...(proportions || {}) } }),
   setAdBreak: (adBreak) => set({ adBreak }),
-  setGems: (gems) => set({ gems }),
   setFriends: (friends) => set({ friends }),
   setSetting: (patch) => set(patch),
 }))

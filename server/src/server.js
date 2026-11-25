@@ -7,11 +7,11 @@ import { resolveIdentity } from './bloxityApi.js'
 import { bloxity } from './bloxityEnv.js'
 import { startBloxityLeaderboards } from './bloxityLeaderboards.js'
 import { closeStorage, openStorage } from './db.js'
-import { gemsWebhook, startGemsPoller } from './gems.js'
 import { installRoomReporter } from './legionRoomReporter.js'
 import { startLeaderboards } from './leaderboards.js'
 import { activePlayers } from './registry.js'
 import { GameRoom } from './rooms/GameRoom.js'
+import { loadAllStages, STAGE_IDS } from '../../shared/stages/index.js'
 
 // Bloxity Legion injects PORT (HTTP and WebSocket share it); 2567 is Colyseus's usual.
 const PORT = Number(process.env.PORT || 2567)
@@ -41,7 +41,7 @@ function routes(app) {
 
   app.get('/api/health', (_req, res) => {
     // `game` lets a development client tell this server from another project's.
-    res.json({ ok: true, game: '1-arm-length', players: activePlayers.size })
+    res.json({ ok: true, game: 'drive-only-up-car-obby', players: activePlayers.size })
   })
 
   /**
@@ -62,18 +62,25 @@ function routes(app) {
   })
 
   /**
-   * Boxity Gems purchases (server to server): recorded here, applied by the pod the
-   * buyer plays on. See gems.js.
+   * Gems are no longer sold (the store takes Sky Pearls). Inert on purpose: should the
+   * host still have a Gems product pointed here, a non-2xx answer makes Boxity refund
+   * the buyer instead of keeping the Gems for nothing.
    */
-  app.post('/api/gems/webhook', gemsWebhook)
+  app.post('/api/gems/webhook', (_req, res) => res.status(410).json({ error: 'Gems are not sold in this game' }))
 }
 
 await openStorage()
+// Every map's stage, built once up front (each room checks moves against its own).
+const stagesStarted = Date.now()
+await loadAllStages()
+console.log(`[server] built ${STAGE_IDS.length} maps in ${Date.now() - stagesStarted} ms`)
 
 const server = defineServer({
   transport: new WebSocketTransport(),
   rooms: {
-    game: defineRoom(GameRoom).enableRealtimeListing(),
+    // One room type for every map: the `stage` join option picks the map, and the
+    // matchmaker only puts players together with others on the same one.
+    game: defineRoom(GameRoom).filterBy(['stage']).enableRealtimeListing(),
   },
   express: routes,
   greet: false,
@@ -90,7 +97,7 @@ server.onShutdown(() => {
 
 await server.listen(PORT)
 // After listen: Boxity's "Open Rooms" list, fed from this pod (legionRoomReporter.js).
-stopTimers.push(startLeaderboards(), startBloxityLeaderboards(), startGemsPoller(), installRoomReporter())
+stopTimers.push(startLeaderboards(), startBloxityLeaderboards(), installRoomReporter())
 console.log(
   `[server] listening on port ${PORT} (Boxity ${bloxity.env}, ${bloxity.apiUrl})` +
     `${process.env.POD_NAME ? ` (${process.env.POD_NAME}, ${process.env.BLOXITY_CHANNEL})` : ''}`,

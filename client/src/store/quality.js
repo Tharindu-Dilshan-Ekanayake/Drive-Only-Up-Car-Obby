@@ -4,8 +4,9 @@ import { create } from 'zustand'
  * Graphics quality presets. Every visual feature reads its settings from here rather
  * than deciding for itself, so dropping a preset reliably sheds load everywhere.
  *
- * LOW is the mobile / weak-PC baseline: no realtime shadows, no particles, no
- * post-processing, short view distance and textures capped at 512px.
+ * LOW is the mobile / weak-PC baseline: no realtime shadows, no particles, no clouds,
+ * no post-processing, fewer CPU racers and less scenery, a short view distance and
+ * textures capped at 512px.
  */
 export const QUALITY_LEVELS = ['LOW', 'MEDIUM', 'HIGH']
 
@@ -17,33 +18,36 @@ export const PRESETS = {
     shadows: 'blob',
     shadowMapSize: 0,
     particles: false,
-    speedLines: true,
-    /** Motion blur down the sides at speed (post-processing): samples a pixel, 0 = off. */
-    motionBlur: 0,
-    viewDistance: 190,
-    fogNear: 60,
-    cloudCount: 8,
-    /** Max side of any generated texture. */
+    clouds: false,
+    // Far enough (and the fog late enough) that the towers along the track still show: at 260 m
+    // with the fog from 90 m they melted into the sky. Measured on all three maps: at most 85k
+    // triangles and 53 draw calls.
+    viewDistance: 340,
+    fogNear: 150,
+    /** Max side of any generated texture (signs, leaderboards). */
     maxTexture: 512,
+    /** CPU racers on the track. */
+    bots: 3,
+    /** How much harbour scenery to place (0-1). */
+    // Just under 0.6 (the line where rooftop clutter and spires switch on): about a building
+    // every 90 m along the track, without the clutter.
+    sceneryDensity: 0.58,
+    /** Other players' names fade out past this. */
+    nameDistance: 60,
+    /** Name tags shown at most (nearest first). */
+    nameplates: 6,
     /**
-     * Other players are drawn this far away - the whole lobby - and the nearest
-     * `remoteAvatars` of them within `remoteAvatarDistance` as their real Boxity avatar
-     * (anyone else as the blocky figure). On every preset that's everyone in the room:
-     * players want to see each other as themselves, across the whole lobby. A Boxity
-     * avatar is ~100 triangles and one draw call plus one per worn item, so a full room
-     * of 8 typically adds 20-40 draw calls; if a weak device can't keep up, the FPS
-     * monitor lowers the resolution (RENDER_SCALES) rather than taking avatars away.
+     * Other players drawn as their full car (nearest first); the rest within view
+     * distance are one instanced low-poly proxy draw (game/remote/RemoteCars.jsx).
      */
-    remoteDrawDistance: 150,
-    remoteAvatars: 7,
-    remoteAvatarDistance: 150,
-    remoteNameDistance: 40,
-    /** World labels fade out past this. */
-    labelDistance: 70,
-    /** How much of the canyon's scenery to spawn (0-1). */
-    decorDensity: 0.45,
-    /** Board and egg halo size multiplier. */
-    boardGlow: 0.8,
+    fullCars: 5,
+    /**
+     * Cars past this distance (m) draw their low-detail body and far wheels
+     * (game/cars/CarRig.js); on LOW the lobby's parked cars are always low detail.
+     */
+    carLod: 18,
+    /** At most this many other cars in full detail per frame (nearest first where the caller sorts), the rest low detail. */
+    carFull: 2,
   },
   MEDIUM: {
     dpr: 1.25,
@@ -51,19 +55,17 @@ export const PRESETS = {
     shadows: 'blob',
     shadowMapSize: 0,
     particles: true,
-    speedLines: true,
-    motionBlur: 8,
-    viewDistance: 300,
-    fogNear: 100,
-    cloudCount: 14,
+    clouds: true,
+    viewDistance: 420,
+    fogNear: 150,
     maxTexture: 1024,
-    remoteDrawDistance: 150,
-    remoteAvatars: 7,
-    remoteAvatarDistance: 150,
-    remoteNameDistance: 55,
-    labelDistance: 110,
-    decorDensity: 0.75,
-    boardGlow: 1,
+    bots: 5,
+    sceneryDensity: 0.75,
+    nameDistance: 90,
+    nameplates: 10,
+    fullCars: 14,
+    carLod: 45,
+    carFull: 12,
   },
   HIGH: {
     dpr: 1.5,
@@ -71,19 +73,17 @@ export const PRESETS = {
     shadows: 'realtime',
     shadowMapSize: 1024,
     particles: true,
-    speedLines: true,
-    motionBlur: 12,
-    viewDistance: 460,
-    fogNear: 140,
-    cloudCount: 18,
+    clouds: true,
+    viewDistance: 600,
+    fogNear: 220,
     maxTexture: 1024,
-    remoteDrawDistance: 150,
-    remoteAvatars: 7,
-    remoteAvatarDistance: 150,
-    remoteNameDistance: 70,
-    labelDistance: 150,
-    decorDensity: 1,
-    boardGlow: 1,
+    bots: 7,
+    sceneryDensity: 1,
+    nameDistance: 120,
+    nameplates: 16,
+    fullCars: 24,
+    carLod: 60,
+    carFull: 30,
   },
 }
 
@@ -124,8 +124,9 @@ export const DEFAULT_LEVEL = 'LOW'
 
 function detectLevel() {
   if (typeof navigator === 'undefined') return DEFAULT_LEVEL
-  const cores = navigator.hardwareConcurrency || 0
-  return isMobileDevice() || cores <= 4 ? 'LOW' : 'MEDIUM'
+  // LOW for everyone to begin with (the smoothest everywhere); Settings > Graphics picks a higher level
+  // and remembers it on this device.
+  return DEFAULT_LEVEL
 }
 
 const initialLevel = readSaved() || detectLevel()
@@ -140,7 +141,7 @@ export const useQuality = create((set, get) => ({
   settings: PRESETS[initialLevel],
   /**
    * Bumped when the player picks a new level by hand: the 3D view is rebuilt from
-   * scratch, so things set when it's made (antialiasing, scenery density, tire detail)
+   * scratch, so things set when it's made (antialiasing, scenery density, CPU racers)
    * take the new level at once.
    */
   rebuild: 0,

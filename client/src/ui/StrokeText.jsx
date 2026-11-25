@@ -1,4 +1,6 @@
-import { memo } from 'react'
+import { memo, useContext } from 'react'
+
+import { FlatFill, flatOf } from './flatFill'
 
 /**
  * Chunky outlined text in the game's style: a thick black outline with a drop under it
@@ -17,9 +19,11 @@ import { memo } from 'react'
  */
 export const StrokeText = memo(function StrokeText({ children, stroke = 6, fill = '#ffffff', gradient, className = '', style }) {
   const width = typeof stroke === 'number' ? `${stroke}px` : stroke
-  const fillStyle = gradient
+  // In the HUD (FlatFill): one colour for the gradient - see ../ui/flatFill.js.
+  const flat = useContext(FlatFill)
+  const fillStyle = gradient && !flat
     ? { backgroundImage: gradient, WebkitBackgroundClip: 'text', backgroundClip: 'text', color: 'transparent' }
-    : { color: fill }
+    : { color: gradient ? flatOf(gradient) : fill }
   return (
     <span className={`pp-text ${className}`} style={style}>
       <span aria-hidden="true" className="pp-text-stroke" style={{ WebkitTextStrokeWidth: width }}>

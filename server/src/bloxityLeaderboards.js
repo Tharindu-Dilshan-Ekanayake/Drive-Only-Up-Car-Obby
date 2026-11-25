@@ -1,3 +1,5 @@
+import { bestAltitude } from '../../shared/logic.js'
+
 import { apiUrl, bloxity } from './bloxityEnv.js'
 import { postJson } from './bloxityApi.js'
 import { activePlayers } from './registry.js'
@@ -18,9 +20,9 @@ import { activePlayers } from './registry.js'
  * shows them through the SDK; keep the two in step.
  */
 export const BLOXITY_LEADERBOARDS = [
-  { id: 'rebirths', label: 'Rebirths', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
-  { id: 'wins', label: 'Total Wins', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
-  { id: 'distance', label: 'Longest Flight (m)', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
+  { id: 'altitude', label: 'Highest Altitude (m)', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
+  { id: 'coins', label: 'Coins Collected', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
+  { id: 'finishes', label: 'Summits Reached', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
   { id: 'playtime', label: 'Minutes Played', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
 ]
 
@@ -28,14 +30,14 @@ const REPORT_MS = 20_000
 /** Boxity takes at most this many scores per call. */
 export const MAX_SCORES_PER_REPORT = 200
 
-/** A profile's score on each board, as whole numbers: `{ rebirths, wins, distance, playtime }`. */
+/** A profile's score on each board, as whole numbers: `{ altitude, coins, finishes, playtime }`. */
 export function leaderboardScores(profile) {
   const stats = profile.stats || {}
   const whole = (n) => (Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0)
   return {
-    rebirths: whole(profile.rebirths),
-    wins: whole(stats.totalWins),
-    distance: whole(stats.bestDistance),
+    altitude: whole(bestAltitude(profile)),
+    coins: whole(stats.totalCoins),
+    finishes: whole(stats.finishes),
     playtime: whole((stats.playtime || 0) / 60),
   }
 }

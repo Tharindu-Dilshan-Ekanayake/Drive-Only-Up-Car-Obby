@@ -2,8 +2,8 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { SPHINX_STOCK_DEFAULT } from '../../shared/balance.js'
-import { normalizeProfile } from '../../shared/logic.js'
+import { bestAltitude, normalizeProfile, toSaveData } from '../../shared/logic.js'
+import { DEFAULT_STAGE } from '../../shared/stages/index.js'
 
 /**
  * Persistence, behind one small async API with two backends:
@@ -12,35 +12,50 @@ import { normalizeProfile } from '../../shared/logic.js'
  *   own managed database, shared by all of the game's pods.
  * - Otherwise one SQLite file through Node's built-in driver, for local development.
  *
- * Profiles are stored whole as JSON, with the leaderboard numbers copied alongside so
- * the boards are plain indexed queries.
+ * Profiles are stored whole as JSON (logic.toSaveData: Sky Docks progress mirrored at
+ * the top level for older readers), with the leaderboard numbers copied alongside so
+ * the boards are plain indexed queries. Best splits go to their own table/collection,
+ * one row per player, map (`stage`) and checkpoint; rows from before maps existed are
+ * Sky Docks ones (migrated on open).
  *
  * Saves are owned. Loading a profile claims it for the session that loaded it
  * (`owner`), and a save from any other owner is dropped: when a player refreshes, or
  * is moved to another pod, the session they left can never write stale progress over
  * the one they're playing in now.
  *
- * Two Boxity records live here too:
+ * A guest save copied into an account (`carriedTo`) is marked so it is copied once only,
+ * and drops off the in-game boards (the account has it now).
  *
- * - A guest save copied into an account (`carriedTo`) is marked so it is copied once
- *   only, and drops off the in-game boards (the account has it now).
- * - Gems purchases (`gem_grants`), recorded by Boxity's webhook on whichever pod it
- *   reached and applied by the pod the buyer plays on. A grant is claimed atomically
- *   before it is applied, so it lands exactly once however many pods look at it.
+ * (Boxity Gems purchases used to be recorded here too, in `gem_grants`. Gems are gone;
+ * an existing `gem_grants` table or collection is simply left alone.)
  */
 
-const DB_PATH = process.env.DB_PATH || fileURLToPath(new URL('../data/tire.db', import.meta.url))
+const DB_PATH = process.env.DB_PATH || fileURLToPath(new URL('../data/up-we-drive.db', import.meta.url))
 
-const BOARDS = { rebirths: 'rebirths', wins: 'totalWins', distance: 'bestDistance', playtime: 'playtime' }
+/** Board id -> the leaderboard field copied alongside each profile (Mongo). */
+const BOARDS = { altitude: 'bestAltitude', coins: 'totalCoins', finishes: 'finishes', playtime: 'playtimeMinutes' }
 
+/** The numbers the boards sort by, copied out of the profile on every save. */
 const leaderboardFields = (profile) => ({
   name: profile.name,
-  rebirths: profile.rebirths,
-  totalWins: profile.stats.totalWins,
-  playtime: profile.stats.playtime,
-  bestDistance: profile.stats.bestDistance,
+  // The highest climb on any map.
+  bestAltitude: Math.floor(bestAltitude(profile)),
+  totalCoins: profile.stats.totalCoins,
+  finishes: profile.stats.finishes,
+  playtimeMinutes: Math.floor(profile.stats.playtime / 60),
   updatedAt: profile.lastSeen,
 })
+
+/** Your best split per map and checkpoint, as `[stage, checkpoint, ms]` (for the checkpoint boards). */
+const splitEntries = (profile) =>
+  Object.entries(profile.maps || {}).flatMap(([stage, progress]) =>
+    Object.entries(progress?.splits || {})
+      .map(([cp, ms]) => [stage, Number(cp), Math.round(ms)])
+      .filter(([, cp, ms]) => Number.isInteger(cp) && cp > 0 && Number.isFinite(ms) && ms > 0),
+  )
+
+/** Mongo split doc id: Sky Docks keeps the pre-maps `<pid>:<cp>` (so old docs are updated, not duplicated). */
+const splitId = (pid, stage, cp) => (stage === DEFAULT_STAGE ? `${pid}:${cp}` : `${pid}:${stage}:${cp}`)
 
 /** A guest's saved profile (JSON), re-keyed as account `accountId`'s, under its name. */
 function rehome(data, accountId, name) {
@@ -62,12 +77,24 @@ async function openMongo(uri) {
   // The database named in the URI: the one Legion scoped to this game.
   const db = client.db()
   const profiles = db.collection('profiles')
-  const kv = db.collection('kv')
-  const gems = db.collection('gem_grants')
+  const splits = db.collection('splits')
+  /** Copies a profile's best splits into the splits collection (one doc per map and checkpoint). */
+  const writeSplits = async (profile) => {
+    const entries = splitEntries(profile)
+    if (!entries.length) return
+    await splits.bulkWrite(
+      entries.map(([stage, cp, ms]) => ({
+        updateOne: { filter: { _id: splitId(profile.id, stage, cp) }, update: { $set: { pid: profile.id, stage, cp, ms, name: profile.name } }, upsert: true },
+      })),
+      { ordered: false },
+    )
+  }
+  // Splits from before maps existed are Sky Docks times.
+  await splits.updateMany({ stage: { $exists: false } }, { $set: { stage: DEFAULT_STAGE } })
   await Promise.all([
+    splits.createIndex({ stage: 1, cp: 1, ms: 1 }),
+    splits.createIndex({ pid: 1 }),
     ...Object.values(BOARDS).map((field) => profiles.createIndex({ [field]: -1 })),
-    gems.createIndex({ userId: 1, applied: 1 }),
-    kv.updateOne({ _id: 'sphinxStock' }, { $setOnInsert: { value: SPHINX_STOCK_DEFAULT } }, { upsert: true }),
   ])
 
   return {
@@ -81,14 +108,23 @@ async function openMongo(uri) {
         // upsert collides on _id instead of overwriting their progress.
         await profiles.updateOne(
           { _id: profile.id, owner },
-          { $set: { owner, data: JSON.stringify(profile), ...leaderboardFields(profile) } },
+          { $set: { owner, data: JSON.stringify(toSaveData(profile)), ...leaderboardFields(profile) } },
           { upsert: true },
         )
+        await writeSplits(profile)
         return true
       } catch (err) {
         if (err?.code === 11000) return false
         throw err
       }
+    },
+    async topSplits(limit, stage, count) {
+      const out = {}
+      for (let cp = 1; cp <= count; cp += 1) {
+        const docs = await splits.find({ stage, cp }, { projection: { name: 1, ms: 1 } }).sort({ ms: 1 }).limit(limit).toArray()
+        out[cp] = docs.map((d) => ({ name: d.name, ms: d.ms }))
+      }
+      return out
     },
     async top(limit) {
       const out = {}
@@ -98,7 +134,7 @@ async function openMongo(uri) {
           .sort({ [field]: -1 })
           .limit(limit)
           .toArray()
-        out[board] = docs.map((d) => ({ name: d.name, value: d[field] ?? 0 }))
+        out[board] = docs.map((d) => ({ name: d.name, score: d[field] ?? 0 }))
       }
       return out
     },
@@ -113,7 +149,10 @@ async function openMongo(uri) {
       if (!guest) return false
       const profile = rehome(guest.data, accountId, name)
       try {
-        await profiles.insertOne({ _id: accountId, owner: null, data: JSON.stringify(profile), ...leaderboardFields(profile) })
+        await profiles.insertOne({ _id: accountId, owner: null, data: JSON.stringify(toSaveData(profile)), ...leaderboardFields(profile) })
+        // The guest's times move with the save.
+        await splits.deleteMany({ pid: guestId })
+        await writeSplits(profile)
         return true
       } catch (err) {
         // The account got a save of its own meanwhile: leave the guest save unused.
@@ -121,38 +160,6 @@ async function openMongo(uri) {
         if (err?.code === 11000) return false
         throw err
       }
-    },
-    async recordGem(grant) {
-      const { transactionId, ...fields } = grant
-      const res = await gems.updateOne(
-        { _id: transactionId },
-        { $setOnInsert: { ...fields, applied: false, receivedAt: Date.now() } },
-        { upsert: true },
-      )
-      return res.upsertedCount > 0
-    },
-    async pendingGems(userIds) {
-      if (!userIds.length) return []
-      const docs = await gems.find({ userId: { $in: userIds }, applied: false }, { projection: { userId: 1, sku: 1 } }).toArray()
-      return docs.map((d) => ({ transactionId: d._id, userId: d.userId, sku: d.sku }))
-    },
-    async claimGem(transactionId, by) {
-      const doc = await gems.findOneAndUpdate(
-        { _id: transactionId, applied: false },
-        { $set: { applied: true, appliedAt: Date.now(), appliedBy: by } },
-      )
-      return Boolean(doc)
-    },
-    async releaseGem(transactionId, by) {
-      await gems.updateOne({ _id: transactionId, appliedBy: by }, { $set: { applied: false }, $unset: { appliedAt: '', appliedBy: '' } })
-    },
-    async stock() {
-      const doc = await kv.findOne({ _id: 'sphinxStock' })
-      return doc ? doc.value : SPHINX_STOCK_DEFAULT
-    },
-    async take() {
-      const doc = await kv.findOneAndUpdate({ _id: 'sphinxStock', value: { $gt: 0 } }, { $inc: { value: -1 } }, { returnDocument: 'after' })
-      return doc ? doc.value : null
     },
     close: () => client.close(),
   }
@@ -168,37 +175,69 @@ async function openSqlite(path) {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       data TEXT NOT NULL,
-      rebirths INTEGER NOT NULL DEFAULT 0,
-      total_wins REAL NOT NULL DEFAULT 0,
-      playtime REAL NOT NULL DEFAULT 0,
-      best_distance REAL NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL
+      best_altitude INTEGER NOT NULL DEFAULT 0,
+      total_coins INTEGER NOT NULL DEFAULT 0,
+      finishes INTEGER NOT NULL DEFAULT 0,
+      playtime_minutes INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      carried_to TEXT
     );
-    CREATE INDEX IF NOT EXISTS profiles_rebirths ON profiles (rebirths DESC);
-    CREATE INDEX IF NOT EXISTS profiles_wins ON profiles (total_wins DESC);
-    CREATE INDEX IF NOT EXISTS profiles_playtime ON profiles (playtime DESC);
-    CREATE INDEX IF NOT EXISTS profiles_distance ON profiles (best_distance DESC);
-    CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS gem_grants (
-      txn TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      sku TEXT NOT NULL,
-      data TEXT NOT NULL,
-      received_at INTEGER NOT NULL,
-      applied INTEGER NOT NULL DEFAULT 0,
-      applied_at INTEGER,
-      applied_by TEXT
-    );
-    CREATE INDEX IF NOT EXISTS gem_grants_user ON gem_grants (user_id, applied);
+    CREATE INDEX IF NOT EXISTS profiles_altitude ON profiles (best_altitude DESC);
+    CREATE INDEX IF NOT EXISTS profiles_coins ON profiles (total_coins DESC);
+    CREATE INDEX IF NOT EXISTS profiles_finishes ON profiles (finishes DESC);
+    CREATE INDEX IF NOT EXISTS profiles_playtime ON profiles (playtime_minutes DESC);
   `)
-  // Files from before guest carry-over lack the column.
-  if (!db.prepare('PRAGMA table_info(profiles)').all().some((c) => c.name === 'carried_to')) {
-    db.exec('ALTER TABLE profiles ADD COLUMN carried_to TEXT')
+  // Splits per map. A table from before maps (no `stage` column, keyed by player and
+  // checkpoint) is rebuilt with every row as a Sky Docks time.
+  const splitCols = db.prepare('PRAGMA table_info(splits)').all().map((c) => c.name)
+  if (splitCols.length && !splitCols.includes('stage')) {
+    db.exec(`
+      BEGIN;
+      ALTER TABLE splits RENAME TO splits_v1;
+      DROP INDEX IF EXISTS splits_time;
+      CREATE TABLE splits (pid TEXT NOT NULL, stage TEXT NOT NULL, cp INTEGER NOT NULL, ms INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (pid, stage, cp));
+      INSERT INTO splits (pid, stage, cp, ms, name) SELECT pid, '${DEFAULT_STAGE}', cp, ms, name FROM splits_v1;
+      DROP TABLE splits_v1;
+      COMMIT;
+    `)
   }
-  const columns = { rebirths: 'rebirths', wins: 'total_wins', distance: 'best_distance', playtime: 'playtime' }
-  const readStock = () => {
-    const row = db.prepare("SELECT value FROM kv WHERE key = 'sphinxStock'").get()
-    return row ? Number(row.value) : SPHINX_STOCK_DEFAULT
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS splits (
+      pid TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      cp INTEGER NOT NULL,
+      ms INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      PRIMARY KEY (pid, stage, cp)
+    );
+    CREATE INDEX IF NOT EXISTS splits_stage_time ON splits (stage, cp, ms);
+  `)
+  const upsertSplit = db.prepare(
+    `INSERT INTO splits (pid, stage, cp, ms, name) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(pid, stage, cp) DO UPDATE SET ms = excluded.ms, name = excluded.name`,
+  )
+  const writeSplits = (profile) => {
+    for (const [stage, cp, ms] of splitEntries(profile)) upsertSplit.run(profile.id, stage, cp, ms, profile.name)
+  }
+  const topSplit = db.prepare('SELECT name, ms FROM splits WHERE stage = ? AND cp = ? ORDER BY ms ASC LIMIT ?')
+  /** Board id -> its column. */
+  const columns = { altitude: 'best_altitude', coins: 'total_coins', finishes: 'finishes', playtime: 'playtime_minutes' }
+  const insert = db.prepare(
+    `INSERT INTO profiles (id, name, data, best_altitude, total_coins, finishes, playtime_minutes, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+  const upsert = db.prepare(
+    `INSERT INTO profiles (id, name, data, best_altitude, total_coins, finishes, playtime_minutes, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name, data = excluded.data, best_altitude = excluded.best_altitude,
+       total_coins = excluded.total_coins, finishes = excluded.finishes,
+       playtime_minutes = excluded.playtime_minutes, updated_at = excluded.updated_at`,
+  )
+  /** A profile as the column values of `insert` / `upsert`. */
+  const row = (profile) => {
+    const f = leaderboardFields(profile)
+    return [profile.id, f.name, JSON.stringify(toSaveData(profile)), f.bestAltitude, f.totalCoins, f.finishes, f.playtimeMinutes, f.updatedAt]
   }
 
   // One process owns this file, so `owner` has nothing to guard against here.
@@ -207,16 +246,14 @@ async function openSqlite(path) {
       return db.prepare('SELECT data FROM profiles WHERE id = ?').get(id)?.data ?? null
     },
     async save(profile) {
-      const f = leaderboardFields(profile)
-      db.prepare(
-        `INSERT INTO profiles (id, name, data, rebirths, total_wins, playtime, best_distance, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           name = excluded.name, data = excluded.data, rebirths = excluded.rebirths,
-           total_wins = excluded.total_wins, playtime = excluded.playtime,
-           best_distance = excluded.best_distance, updated_at = excluded.updated_at`,
-      ).run(profile.id, f.name, JSON.stringify(profile), f.rebirths, f.totalWins, f.playtime, f.bestDistance, f.updatedAt)
+      upsert.run(...row(profile))
+      writeSplits(profile)
       return true
+    },
+    async topSplits(limit, stage, count) {
+      const out = {}
+      for (let cp = 1; cp <= count; cp += 1) out[cp] = topSplit.all(stage, cp, limit).map((r) => ({ name: r.name, ms: r.ms }))
+      return out
     },
     async top(limit) {
       const out = {}
@@ -224,7 +261,7 @@ async function openSqlite(path) {
         out[board] = db
           .prepare(`SELECT name, ${column} AS value FROM profiles WHERE carried_to IS NULL ORDER BY ${column} DESC LIMIT ?`)
           .all(limit)
-          .map((r) => ({ name: r.name, value: r.value }))
+          .map((r) => ({ name: r.name, score: r.value }))
       }
       return out
     },
@@ -233,64 +270,22 @@ async function openSqlite(path) {
       const guest = db.prepare('SELECT data FROM profiles WHERE id = ? AND carried_to IS NULL').get(guestId)
       if (!guest) return false
       const profile = rehome(guest.data, accountId, name)
-      const f = leaderboardFields(profile)
       // Synchronous, so nothing can come between the checks above and these two writes.
       db.prepare('UPDATE profiles SET carried_to = ? WHERE id = ?').run(accountId, guestId)
-      db.prepare(
-        `INSERT INTO profiles (id, name, data, rebirths, total_wins, playtime, best_distance, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(accountId, f.name, JSON.stringify(profile), f.rebirths, f.totalWins, f.playtime, f.bestDistance, f.updatedAt)
+      insert.run(...row(profile))
+      db.prepare('DELETE FROM splits WHERE pid = ?').run(guestId)
+      writeSplits(profile)
       return true
-    },
-    async recordGem(grant) {
-      const { transactionId, userId, sku, ...rest } = grant
-      const res = db
-        .prepare('INSERT INTO gem_grants (txn, user_id, sku, data, received_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(txn) DO NOTHING')
-        .run(transactionId, userId, sku, JSON.stringify(rest), Date.now())
-      return res.changes > 0
-    },
-    async pendingGems(userIds) {
-      if (!userIds.length) return []
-      return db
-        .prepare(`SELECT txn, user_id, sku FROM gem_grants WHERE applied = 0 AND user_id IN (${userIds.map(() => '?').join(',')})`)
-        .all(...userIds)
-        .map((r) => ({ transactionId: r.txn, userId: r.user_id, sku: r.sku }))
-    },
-    async claimGem(transactionId, by) {
-      const res = db
-        .prepare('UPDATE gem_grants SET applied = 1, applied_at = ?, applied_by = ? WHERE txn = ? AND applied = 0')
-        .run(Date.now(), by, transactionId)
-      return res.changes > 0
-    },
-    async releaseGem(transactionId, by) {
-      db.prepare('UPDATE gem_grants SET applied = 0, applied_at = NULL, applied_by = NULL WHERE txn = ? AND applied_by = ?').run(
-        transactionId,
-        by,
-      )
-    },
-    async stock() {
-      return readStock()
-    },
-    async take() {
-      const stock = readStock()
-      if (stock <= 0) return null
-      db.prepare("INSERT INTO kv (key, value) VALUES ('sphinxStock', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
-        String(stock - 1),
-      )
-      return stock - 1
     },
     close: async () => db.close(),
   }
 }
 
 let store = null
-/** Sphinx stock as last known here; kept current from the database. */
-let stock = SPHINX_STOCK_DEFAULT
 
 /** Opens the database: MongoDB if MONGODB_URI is set, else the local SQLite file. */
 export async function openStorage({ mongoUri = process.env.MONGODB_URI, path = DB_PATH } = {}) {
   store = mongoUri ? await openMongo(mongoUri) : await openSqlite(path)
-  stock = await store.stock()
   console.log(`[db] using ${mongoUri ? 'MongoDB' : `SQLite at ${path}`}`)
 }
 
@@ -351,49 +346,8 @@ export async function carryOverGuest(accountId, guestIds, name) {
   return null
 }
 
-/**
- * Records a Gems purchase Boxity confirmed: `{ transactionId, userId, sku, ... }`.
- * Idempotent by transactionId (Boxity may deliver a webhook twice). Resolves true for
- * a new grant, false for one already recorded.
- */
-export const recordGemGrant = (grant) => store.recordGem(grant)
-
-/** Unapplied grants for any of `userIds`: `[{ transactionId, userId, sku }]`. */
-export const pendingGemGrants = (userIds) => store.pendingGems(userIds)
-
-/**
- * Claims grant `transactionId` for pod `by`. Resolves true for exactly one caller,
- * ever; only that caller may apply it.
- */
-export const claimGemGrant = (transactionId, by) => store.claimGem(transactionId, by)
-
-/** Gives back a claim whose player left before the grant could be applied. */
-export const releaseGemGrant = (transactionId, by) => store.releaseGem(transactionId, by)
-
-/** Top `limit` players per board: `{ rebirths: [{ name, value }], ... }`. */
+/** Top `limit` players per board: `{ altitude: [{ name, score }], coins, finishes, playtime }`. */
 export const topPlayers = (limit = 10) => store.top(limit)
 
-export const getSphinxStock = () => stock
-
-/**
- * Takes one Sphinx. Synchronous for the purchase rules: decided on the stock known
- * here, then made permanent in the database, which has the final say (another pod may
- * have sold the last one a moment ago). Returns false when sold out.
- */
-export function takeSphinx() {
-  if (stock <= 0) return false
-  stock -= 1
-  store
-    .take()
-    .then((left) => {
-      stock = left ?? 0
-    })
-    .catch((err) => console.error('[db] sphinx stock update failed', err))
-  return true
-}
-
-/** Re-reads the stock, so sales on other pods show up here. */
-export async function refreshStock() {
-  stock = await store.stock()
-  return stock
-}
+/** Fastest `limit` best splits on map `stage` at each checkpoint 1..count: `{ [cp]: [{ name, ms }] }`. */
+export const topSplits = (limit, stage, count) => store.topSplits(limit, stage, count)

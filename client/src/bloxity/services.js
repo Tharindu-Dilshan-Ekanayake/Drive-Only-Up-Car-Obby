@@ -1,22 +1,20 @@
-import { GEM_PRODUCTS } from '@shared/balance'
-
-import { actions, send } from '../net/actions'
+import { actions } from '../net/actions'
 import { currentRoomId, isOnline } from '../net/connection'
 import { getGame } from '../store/game'
 import { getSDK, safeCall } from './sdk'
 import { getBloxityState, useBloxityStore } from './store'
 
 /**
- * Boxity services for the game's UI: rewarded ads, Gems, friends and invites, screen
+ * Boxity services for the game's UI: rewarded ads, friends and invites, screen
  * ads and the portal's leaderboards. Plain functions - call them from anywhere.
  *
  * Every call is safe without the SDK (offline, outside Boxity, script blocked): it
  * reports "not available" instead of throwing. Async ones never reject.
  *
  * Grants are never decided here. Online, the game server verifies Boxity's word (the
- * rewarded-ad token, the Gems webhook). Offline there is no server, so the offline
+ * rewarded-ad token). Offline there is no server, so the offline
  * stand-in (net/localServer.js) grants - and it is only told to after Boxity reported
- * a completed ad / a successful purchase.
+ * a completed ad.
  */
 
 const errorText = (err) => (err instanceof Error ? err.message : String(err ?? 'error'))
@@ -61,71 +59,6 @@ export async function watchRewardedAd(placement) {
     return { ok: false, status, reason: 'not-connected' }
   } catch (err) {
     return { ok: false, status: 'error', reason: errorText(err) }
-  }
-}
-
-// --- Gems -----------------------------------------------------------------------------
-
-const gemsApi = () => {
-  const sdk = getSDK()
-  return sdk?.gems || sdk?.bux || null
-}
-
-/** Re-reads the signed-in player's Gems balance into the store (null for guests). */
-export async function refreshGemsBalance() {
-  const store = useBloxityStore.getState()
-  const user = store.user
-  const gems = gemsApi()
-  if (!user || typeof gems?.getBalance !== 'function') {
-    store.setGems(null)
-    return null
-  }
-  try {
-    const balance = Number(await gems.getBalance())
-    // Signed out (or someone else signed in) meanwhile: that answer is stale.
-    if (useBloxityStore.getState().user !== user) return getBloxityState().gems
-    const value = Number.isFinite(balance) ? balance : null
-    useBloxityStore.getState().setGems(value)
-    return value
-  } catch (err) {
-    console.warn('[bloxity] Gems balance unavailable', err)
-    return getBloxityState().gems
-  }
-}
-
-/** The last known Gems balance, or null when unknown. */
-export function getGemsBalance() {
-  return getBloxityState().gems
-}
-
-/** React hook: the Gems balance (null when unknown); re-renders when it changes. */
-export function useGemsBalance() {
-  return useBloxityStore((s) => s.gems)
-}
-
-/**
- * Buys Gems product `sku` (a key of GEM_PRODUCTS). Boxity shows its own confirmation
- * with the price; the game never shows or decides prices.
- *
- * @returns {Promise<{ success: boolean, error?: string }>}
- */
-export async function buyGems(sku) {
-  try {
-    if (!Object.hasOwn(GEM_PRODUCTS, sku)) return { success: false, error: 'Unknown product' }
-    const gems = gemsApi()
-    if (typeof gems?.requestPurchase !== 'function') return { success: false, error: 'Gems are not available here' }
-    // Only the sku: price and grant are Boxity's and the server's business.
-    const result = await gems.requestPurchase(sku)
-    if (!result?.success) return { success: false, error: result?.error || 'Purchase cancelled' }
-
-    // Online, the server applies the grant Boxity's webhook recorded; offline, the
-    // local stand-in grants it.
-    if (isOnline()) actions.gemsCheck()
-    else if (playingOffline()) send('gemsLocal', { sku })
-    refreshGemsBalance()
-    return { success: true }
-  } catch (err) {
-    return { success: false, error: errorText(err) }
   }
 }
 
@@ -229,10 +162,8 @@ export function openBoxityLeaderboard(id) {
 export function onAccountChanged(user) {
   if (user) {
     refreshFriends()
-    refreshGemsBalance()
   } else {
     useBloxityStore.getState().setFriends([])
-    useBloxityStore.getState().setGems(null)
   }
 }
 

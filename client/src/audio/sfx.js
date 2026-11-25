@@ -1,18 +1,19 @@
-import { RUN_CADENCE } from '../game/kick'
-
 import { useQuality } from '../store/quality'
-import { createCrowd } from './crowd'
 import { createMusic } from './music'
 
 /**
- * Sound effects, the crowd and the background music, synthesised with WebAudio: no audio
- * files to download.
+ * Sound effects, the engine and the background music for Up We Drive, all synthesised
+ * with WebAudio: no audio files to download.
  *
  * Browsers only allow audio after a user gesture. The audio engine (AudioContext, echo,
  * noise, music) is built while the game loads (prepareAudio), where it costs nothing
- * anyone sees - built on the first tap instead, it froze whatever that tap did. It
- * starts suspended; the first tap/click/key resumes it and starts the music, and every
- * sound before that is silently skipped.
+ * anyone sees. It starts suspended; the first tap/click/key resumes it and starts the
+ * music, and every one-shot before that is silently skipped.
+ *
+ * Continuous voices (`engine`, `skid`, `ambience`) are built once and then only steered
+ * with setTargetAtTime: their per-frame setters never allocate. The engine's backfire
+ * pops, turbo blow-off and gear-shift dips are fired the same way, by automating gains
+ * on voices that already exist.
  */
 
 const MUTE_KEY = 'pp.muted'
@@ -25,18 +26,15 @@ let master = null
 let echo = null
 let noiseBuffer = null
 let music = null
-/** The stadium crowd (crowd.js): murmuring always, roaring at the big moments. */
-let crowd = null
 /** The player's own mute button (persisted). */
 let muted = readMuted()
-/**
- * Muted for a Boxity ad break. Kept apart from `muted` so the break ending restores
- * whatever the player had chosen, never overwrites it.
- */
+/** Muted for a Boxity ad break; kept apart from `muted` so the player's choice survives. */
 let adMuted = false
-/** Boxity's master_volume / music_volume settings, 0..1 (not persisted: Boxity keeps them). */
+/** Boxity's master_volume / music_volume settings, 0..1. */
 let masterVolume = 1
 let musicVolume = 1
+/** How busy the music is, 0..1 (see setMusicIntensity). */
+let musicIntensity = 0
 const lastPlayed = new Map()
 const muteListeners = new Set()
 
@@ -54,6 +52,9 @@ function applyMaster() {
   if (master) master.gain.value = silent() ? 0 : BASE_GAIN * masterVolume
 }
 
+/** LOW preset: lighter music (fewer voices per beat). */
+const lite = () => useQuality.getState().level === 'LOW'
+
 /**
  * Builds the audio engine, suspended: the context, the master gain, the echo, the noise
  * and the music. Call while loading (GameScene does); the first gesture then only has
@@ -64,46 +65,37 @@ export function prepareAudio() {
   const Ctor = window.AudioContext || window.webkitAudioContext
   if (!Ctor) return
   ctx = new Ctor()
-  // Created outside a gesture it starts suspended anyway; make sure of it until a tap.
   if (ctx.state === 'running') ctx.suspend()
   master = ctx.createGain()
   applyMaster()
   master.connect(ctx.destination)
   echo = createEcho()
-  // One second of white noise, reused by every whoosh and crack.
+  // One second of white noise, reused by every whoosh, splash and tyre squeal.
   noiseBuffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate)
   const data = noiseBuffer.getChannelData(0)
   for (let i = 0; i < data.length; i += 1) data[i] = Math.random() * 2 - 1
-  music = createMusic(ctx, master, noiseBuffer)
+  music = createMusic(ctx, master, noiseBuffer, lite)
   music.setVolume(musicVolume)
-  crowd = createCrowd(ctx, master, noiseBuffer)
+  music.setIntensity(musicIntensity)
+  // The car asked for its engine (or the world for its ambience) before the context
+  // existed: build them now.
+  if (engineWanted) buildEngine()
+  if (ambienceWanted) buildAmbience()
 }
-
-/**
- * Low-end devices (the LOW preset) get no crowd: its cheers and claps are dozens of audio
- * nodes at a time, built on the main thread - on a slow phone, frames lost mid-flight.
- */
-const lite = () => useQuality.getState().level === 'LOW'
-const liveCrowd = () => (lite() ? null : crowd)
 
 let musicStarted = false
 function unlock() {
-  // Built already while loading, normally; on the spot if a tap beat it to it.
   prepareAudio()
   if (!ctx) return
   if (!musicStarted) {
     musicStarted = true
     music.start()
-    liveCrowd()?.start()
   }
   if (adMuted) ctx.suspend()
   else if (ctx.state === 'suspended') ctx.resume()
 }
 
-/**
- * A short, darkening echo for the chimes to ring out into, so they sparkle instead of
- * clicking off. Built once; every sound sent to it shares it.
- */
+/** A short, darkening echo for the chimes to ring out into. Built once. */
 function createEcho() {
   const input = ctx.createGain()
   input.gain.value = 0.25
@@ -130,7 +122,7 @@ export function installAudioUnlock() {
   for (const e of events) window.addEventListener(e, handler, true)
   // Mobile browsers suspend audio in the background; resume on return.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && ctx?.state === 'suspended' && !adMuted) ctx.resume()
+    if (document.visibilityState === 'visible' && ctx?.state === 'suspended' && !adMuted && musicStarted) ctx.resume()
   })
 }
 
@@ -139,9 +131,9 @@ export function isMuted() {
 }
 
 export function setMuted(value) {
-  muted = value
+  muted = Boolean(value)
   try {
-    localStorage.setItem(MUTE_KEY, value ? '1' : '0')
+    localStorage.setItem(MUTE_KEY, muted ? '1' : '0')
   } catch {
     // Not persisted; fine.
   }
@@ -164,16 +156,15 @@ export function setMusicVolume(volume) {
 }
 
 /**
- * Silences everything for a Boxity ad break, and suspends the audio clock so the music
- * scheduler doesn't pile notes up behind it. Ending the break restores the player's
- * own mute choice and volumes exactly as they were.
+ * Silences everything for a Boxity ad break and suspends the audio clock. Ending the
+ * break restores the player's own mute choice and volumes exactly as they were.
  */
 export function setAdBreakMuted(on) {
   adMuted = Boolean(on)
   applyMaster()
   if (!ctx) return
   if (adMuted) ctx.suspend()
-  else if (ctx.state === 'suspended' && document.visibilityState === 'visible') ctx.resume()
+  else if (ctx.state === 'suspended' && document.visibilityState === 'visible' && musicStarted) ctx.resume()
 }
 
 /** Calls `listener(muted)` on every change; returns the unsubscribe. */
@@ -182,178 +173,22 @@ export function onMutedChange(listener) {
   return () => muteListeners.delete(listener)
 }
 
-// --- The flight: rushing through the air ------------------------------------------------
-
-let ride = null
-let rideSetAt = 0
-
 /**
- * You in flight: a low, soft rush of air, swelling and fluttering with your speed - a
- * round, low-passed sound with no hiss in it - while the crowd "ooohs". The music ducks
- * under it until `windStop`.
+ * How intense the music is, 0..1: above 0 an extra layer of percussion and a rippling
+ * arpeggio fades in (smoothly, over a second or so). Cheap: may be called every frame,
+ * it only acts on real changes. LOW quality skips the layer.
  */
-function windStart() {
-  if (!ctx || ride || ctx.state !== 'running') return
-  const t = ctx.currentTime
-  const src = ctx.createBufferSource()
-  src.buffer = noiseBuffer
-  src.loop = true
-  // Only the low rush of air: everything above ~900 Hz is cut, which is what hissed.
-  const body = ctx.createBiquadFilter()
-  body.type = 'lowpass'
-  body.frequency.value = 420
-  body.Q.value = 0.8
-  const air = ctx.createGain()
-  air.gain.value = 0.0001
-  src.connect(body).connect(air).connect(master)
-  // The tumble: the air's loudness swells and dips once a turn.
-  const tumble = ctx.createOscillator()
-  tumble.frequency.value = 4
-  const depth = ctx.createGain()
-  depth.gain.value = 0
-  tumble.connect(depth).connect(air.gain)
-  // A low hum under it, so it reads as a thing spinning, not wind.
-  const hum = ctx.createOscillator()
-  hum.type = 'triangle'
-  hum.frequency.value = 70
-  const humGain = ctx.createGain()
-  humGain.gain.value = 0.0001
-  hum.connect(humGain).connect(master)
-  src.start(t)
-  tumble.start(t)
-  hum.start(t)
-  ride = { src, air, body, tumble, depth, hum, humGain }
-  music?.duck(true)
-  liveCrowd()?.anticipate(true)
+export function setMusicIntensity(value) {
+  musicIntensity = Math.min(1, Math.max(0, Number(value) || 0))
+  music?.setIntensity(musicIntensity)
 }
 
-/**
- * `level` 0..1 from your speed; `airborne` while you fly (silent once you land: the
- * landing's own sounds take over). Positional: it's called every frame.
- */
-function windSet(level, airborne = false) {
-  if (!ride) return
-  // Ten updates a second is plenty for a smooth swell.
-  const now = performance.now()
-  if (now - rideSetAt < 100) return
-  rideSetAt = now
-  const t = ctx.currentTime
-  const l = Math.min(1, Math.max(0, level))
-  const on = airborne ? 1 : 0
-  const loud = on * (0.012 + l * 0.05)
-  ride.air.gain.setTargetAtTime(loud, t, 0.15)
-  ride.depth.gain.setTargetAtTime(loud * 0.8, t, 0.15)
-  ride.body.frequency.setTargetAtTime(300 + l * 600, t, 0.2)
-  ride.tumble.frequency.setTargetAtTime(3 + l * 7, t, 0.25)
-  ride.hum.frequency.setTargetAtTime(60 + l * 50, t, 0.25)
-  ride.humGain.gain.setTargetAtTime(on * (0.006 + l * 0.012), t, 0.15)
+/** Ducks the music under something loud (a big moment), or brings it back. */
+export function duckMusic(on) {
+  music?.duck(on)
 }
 
-function windStop() {
-  if (!ride) return
-  const { src, air, depth, tumble, hum, humGain } = ride
-  ride = null
-  const t = ctx.currentTime
-  air.gain.setTargetAtTime(0.0001, t, 0.15)
-  depth.gain.setTargetAtTime(0, t, 0.15)
-  humGain.gain.setTargetAtTime(0.0001, t, 0.15)
-  src.stop(t + 1)
-  tumble.stop(t + 1)
-  hum.stop(t + 1)
-  music?.duck(false)
-  liveCrowd()?.anticipate(false)
-}
-
-// --- The pull-up bar: a springy boing every rep ----------------------------------------
-
-/** Seconds between reps on a bar: one a TRAIN_INTERVAL (kick.RUN_CADENCE is its phase speed). */
-const REP = (Math.PI * 2) / RUN_CADENCE
-let bar = null
-
-/**
- * Starts the reps' sound under you: each pull-up a rubbery "boi-oing" as your arms snap
- * short and a soft creak as they stretch back out (scheduled a little ahead on the audio
- * clock, like the music). Stopped by treadmillStop (the template's name) when you let go.
- */
-function treadmillStart() {
-  if (!ctx || bar || silent() || ctx.state !== 'running') return
-  let next = ctx.currentTime + REP * 0.25
-  const schedule = () => {
-    next = Math.max(next, ctx.currentTime + 0.02)
-    while (next < ctx.currentTime + 0.4) {
-      const at = next - ctx.currentTime
-      tone(150, { type: 'triangle', at, duration: 0.2, volume: 0.06, slideTo: 380 })
-      tone(760, { type: 'sine', at: at + 0.02, duration: 0.07, volume: 0.02, slideTo: 1100 })
-      tone(120, { type: 'sawtooth', at: at + REP * 0.5, duration: 0.18, volume: 0.012, slideTo: 85 })
-      next += REP
-    }
-  }
-  bar = { timer: setInterval(schedule, 100) }
-  schedule()
-}
-
-/** Letting go of the bar: the reps stop. */
-function treadmillStop() {
-  if (!bar) return
-  clearInterval(bar.timer)
-  bar = null
-}
-
-// --- The stretch: rubber creaking as you pull back on the launch posts ---------------
-
-let stretch = null
-let stretchSetAt = 0
-
-/**
- * Holding LAUNCH: a taut rubber creak that climbs in pitch the further back you pull and,
- * once it's full, trembles with every twang. Moved by stretchSet, stopped by stretchStop.
- */
-function stretchStart() {
-  if (!ctx || stretch || silent() || ctx.state !== 'running') return
-  const t = ctx.currentTime
-  const osc = ctx.createOscillator()
-  osc.type = 'sawtooth'
-  osc.frequency.value = 70
-  const filter = ctx.createBiquadFilter()
-  filter.type = 'bandpass'
-  filter.frequency.value = 520
-  filter.Q.value = 3
-  const gain = ctx.createGain()
-  gain.gain.setValueAtTime(0.0001, t)
-  gain.gain.setTargetAtTime(0.03, t, 0.05)
-  // The creak: the rubber's loudness fluttering fast.
-  const lfo = ctx.createOscillator()
-  lfo.frequency.value = 14
-  const depth = ctx.createGain()
-  depth.gain.value = 0.018
-  lfo.connect(depth).connect(gain.gain)
-  osc.connect(filter).connect(gain).connect(master)
-  osc.start(t)
-  lfo.start(t)
-  stretch = { osc, filter, gain, lfo }
-}
-
-/** `charge` 0-1, the stretch meter; `full` once it twangs. Called every frame. */
-function stretchSet(charge, full = false) {
-  if (!stretch) return
-  const now = performance.now()
-  if (now - stretchSetAt < 40) return
-  stretchSetAt = now
-  const t = ctx.currentTime
-  stretch.osc.frequency.setTargetAtTime(70 + charge * 200, t, 0.03)
-  stretch.filter.frequency.setTargetAtTime(480 + charge * 1500, t, 0.04)
-  stretch.lfo.frequency.setTargetAtTime(full ? 32 : 12 + charge * 10, t, 0.05)
-}
-
-function stretchStop() {
-  if (!stretch) return
-  const { osc, gain, lfo } = stretch
-  stretch = null
-  const t = ctx.currentTime
-  gain.gain.setTargetAtTime(0.0001, t, 0.03)
-  osc.stop(t + 0.3)
-  lfo.stop(t + 0.3)
-}
+// --- one-shot building blocks ----------------------------------------------------------
 
 function ready(name, minGapMs = 0) {
   if (!ctx || silent() || ctx.state !== 'running') return false
@@ -364,12 +199,22 @@ function ready(name, minGapMs = 0) {
 }
 
 /**
+ * The audio engine for sounds made elsewhere (Heat Run's sirens, ./heatSfx.js): the
+ * context, the master gain and the shared noise buffer - or null before prepareAudio.
+ * `ready(name, minGapMs)` throttles one-shots the same way as here.
+ */
+export const audioBus = () => (ctx ? { ctx, master, noise: noiseBuffer, ready } : null)
+
+/** How early (s) a deferred sound is built before it's due. */
+const LEAD = 0.06
+
+/**
  * Runs `build(t)` for a sound due `at` seconds from now: straight away when it's due
- * soon, otherwise just before it's due (`t` still lands it on time). So a chord, a run of
- * bells or a round of applause doesn't create dozens of audio nodes in the one frame that
- * asked for it - on a slow phone that frame stuck.
+ * soon, otherwise just before it's due, so a fanfare doesn't create dozens of audio
+ * nodes in the one frame that asked for it.
  */
 export function whenDue(at, build) {
+  if (!ctx) return
   const due = ctx.currentTime + at
   if (at <= LEAD) {
     build(due)
@@ -379,15 +224,13 @@ export function whenDue(at, build) {
     if (ctx) build(Math.max(ctx.currentTime, due))
   }, (at - LEAD) * 1000)
 }
-/** How early (s) a deferred sound is built before it's due. */
-const LEAD = 0.06
 
 /** A short enveloped oscillator note; `echo` also sends it into the echo. */
 function tone(freq, opts = {}) {
   whenDue(opts.at ?? 0, (t) => toneAt(freq, t, opts))
 }
 
-function toneAt(freq, t, { type = 'sine', duration = 0.12, volume = 0.3, slideTo = null, attack = 0.01, echo: wet = false } = {}) {
+function toneAt(freq, t, { type = 'sine', duration = 0.12, volume = 0.3, slideTo = null, attack = 0.01, echo: wet = false, cutoff = 0 } = {}) {
   const osc = ctx.createOscillator()
   const gain = ctx.createGain()
   osc.type = type
@@ -396,7 +239,15 @@ function toneAt(freq, t, { type = 'sine', duration = 0.12, volume = 0.3, slideTo
   gain.gain.setValueAtTime(0.0001, t)
   gain.gain.exponentialRampToValueAtTime(volume, t + attack)
   gain.gain.exponentialRampToValueAtTime(0.0001, t + duration)
-  osc.connect(gain).connect(master)
+  if (cutoff) {
+    const filter = ctx.createBiquadFilter()
+    filter.type = 'lowpass'
+    filter.frequency.value = cutoff
+    osc.connect(filter).connect(gain)
+  } else {
+    osc.connect(gain)
+  }
+  gain.connect(master)
   if (wet) gain.connect(echo)
   osc.start(t)
   osc.stop(t + duration + 0.02)
@@ -409,312 +260,788 @@ function bell(freq, { at = 0, volume = 0.1, decay = 0.4 } = {}) {
   tone(freq * 3.01, { type: 'triangle', at, duration: 0.05, volume: volume * 0.3 })
 }
 
-/** Trophy chimes climb and fall this scale while they keep coming (C major pentatonic). */
-const TROPHY_SCALE = [1047, 1175, 1319, 1568, 1760, 2093, 2349, 2637]
-/** A trophy within this long of the last carries the run on; otherwise it starts again. */
-const TROPHY_RUN_MS = 700
-let trophyRun = 0
-let trophyAt = 0
-
-/** Filtered noise: whooshes and cracks. */
+/** Filtered noise: whooshes, splashes, crunches. */
 function noise(opts = {}) {
   whenDue(opts.at ?? 0, (t) => noiseAt(t, opts))
 }
 
-function noiseAt(t, { duration = 0.3, volume = 0.25, from = 400, to = 2400, q = 1.2 } = {}) {
+function noiseAt(t, { duration = 0.3, volume = 0.25, from = 400, to = 2400, q = 1.2, type = 'bandpass', attack = 0.3 } = {}) {
   const src = ctx.createBufferSource()
   src.buffer = noiseBuffer
+  src.loop = true
   const filter = ctx.createBiquadFilter()
-  filter.type = 'bandpass'
+  filter.type = type
   filter.Q.value = q
   filter.frequency.setValueAtTime(from, t)
   filter.frequency.exponentialRampToValueAtTime(to, t + duration)
   const gain = ctx.createGain()
   gain.gain.setValueAtTime(0.0001, t)
-  gain.gain.exponentialRampToValueAtTime(volume, t + duration * 0.3)
+  gain.gain.exponentialRampToValueAtTime(volume, t + Math.max(0.005, duration * attack))
   gain.gain.exponentialRampToValueAtTime(0.0001, t + duration)
   src.connect(filter).connect(gain).connect(master)
-  // Looped, so a long one from a random spot never runs off the end of the second.
-  src.loop = true
   src.start(t, Math.random() * 0.5)
   src.stop(t + duration + 0.02)
 }
+
+/** Note number -> Hz. */
+const hz = (midi) => 440 * 2 ** ((midi - 69) / 12)
+
+/** A quick rising arpeggio of MIDI notes, `step` seconds apart. */
+function arpeggio(notes, { step = 0.07, type = 'square', volume = 0.07, duration = 0.16, at = 0, echo: wet = true } = {}) {
+  notes.forEach((n, i) => tone(hz(n), { type, at: at + i * step, duration, volume, echo: wet, cutoff: 3200 }))
+}
+
+/** Sparkles: a fast run of high bells. */
+function sparkle(count, { at = 0, base = 84, volume = 0.04 } = {}) {
+  const scale = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24]
+  for (let i = 0; i < count; i += 1) bell(hz(base + scale[i % scale.length]), { at: at + i * 0.045, volume, decay: 0.25 })
+}
+
+// --- the engine ------------------------------------------------------------------------
+
+let engineWanted = false
+/** The engine's nodes once built (see buildEngine). */
+let eng = null
+let engineSetAt = 0
+/** Per-engine state the setter steers by (plain numbers: the setter never allocates). */
+let lastGear = 0
+let throttlePeak = 0
+let turboSpool = 0
+let lastPopAt = 0
+
+/** Gear changes at these speeds (fractions of top speed): the revs drop at each. */
+const GEARS = [0, 0.18, 0.38, 0.6, 0.82, 1.01]
+
+function buildEngine() {
+  if (!ctx || eng) return
+  const t = ctx.currentTime
+  const oscA = ctx.createOscillator()
+  oscA.type = 'sawtooth'
+  oscA.frequency.value = 55
+  const oscB = ctx.createOscillator()
+  oscB.type = 'square'
+  oscB.frequency.value = 55
+  oscB.detune.value = 14
+  const sub = ctx.createOscillator()
+  sub.type = 'sine'
+  sub.frequency.value = 27.5
+  const filter = ctx.createBiquadFilter()
+  filter.type = 'lowpass'
+  filter.frequency.value = 420
+  filter.Q.value = 2.2
+  const mixA = ctx.createGain()
+  mixA.gain.value = 0.55
+  const mixB = ctx.createGain()
+  mixB.gain.value = 0.3
+  const mixSub = ctx.createGain()
+  mixSub.gain.value = 0.8
+  const gain = ctx.createGain()
+  gain.gain.value = 0.0001
+  // Gear shifts dip this one (the setter keeps re-aiming `gain`, so the dip lives apart).
+  const shift = ctx.createGain()
+  shift.gain.value = 1
+  oscA.connect(mixA).connect(filter)
+  oscB.connect(mixB).connect(filter)
+  sub.connect(mixSub).connect(gain)
+  filter.connect(gain).connect(shift).connect(master)
+  // Turbo whistle: a faint sine that spools up with throttle and revs.
+  const turbo = ctx.createOscillator()
+  turbo.type = 'sine'
+  turbo.frequency.value = 1800
+  const turboGain = ctx.createGain()
+  turboGain.gain.value = 0.0001
+  turbo.connect(turboGain).connect(shift)
+  // Pops (backfires) and the blow-off hiss: one silent noise voice, two filters, fired
+  // by gain automation, so nothing is created when they go off.
+  const pops = ctx.createBufferSource()
+  pops.buffer = noiseBuffer
+  pops.loop = true
+  const popFilter = ctx.createBiquadFilter()
+  popFilter.type = 'lowpass'
+  popFilter.frequency.value = 900
+  popFilter.Q.value = 4
+  const popGain = ctx.createGain()
+  popGain.gain.value = 0
+  pops.connect(popFilter).connect(popGain).connect(master)
+  const bovFilter = ctx.createBiquadFilter()
+  bovFilter.type = 'highpass'
+  bovFilter.frequency.value = 2600
+  const bovGain = ctx.createGain()
+  bovGain.gain.value = 0
+  pops.connect(bovFilter).connect(bovGain).connect(master)
+  // A little grit, plus the boost's hiss on top.
+  const hiss = ctx.createBufferSource()
+  hiss.buffer = noiseBuffer
+  hiss.loop = true
+  const hissFilter = ctx.createBiquadFilter()
+  hissFilter.type = 'bandpass'
+  hissFilter.frequency.value = 900
+  hissFilter.Q.value = 0.7
+  const hissGain = ctx.createGain()
+  hissGain.gain.value = 0.0001
+  hiss.connect(hissFilter).connect(hissGain).connect(master)
+  oscA.start(t)
+  oscB.start(t)
+  sub.start(t)
+  hiss.start(t)
+  turbo.start(t)
+  pops.start(t, 0.37)
+  eng = { oscA, oscB, sub, filter, gain, shift, hissGain, hissFilter, hiss, turbo, turboGain, pops, popFilter, popGain, bovGain }
+  lastGear = 0
+  throttlePeak = 0
+  turboSpool = 0
+}
+
+/** A short burst on a persistent voice's gain: up in 4 ms, back to silence by `end`. */
+function burst(param, t, peak, end) {
+  param.setValueAtTime(0, t)
+  param.linearRampToValueAtTime(peak, t + 0.004)
+  param.linearRampToValueAtTime(0, t + end)
+}
+
+/** One to three exhaust pops on lift-off. Only automation: allocation-free. */
+function backfire(t) {
+  eng.popGain.gain.cancelScheduledValues(t)
+  const count = 1 + Math.floor(Math.random() * 3)
+  let at = t + 0.03
+  for (let i = 0; i < count; i += 1) {
+    eng.popFilter.frequency.setValueAtTime(450 + Math.random() * 700, at)
+    burst(eng.popGain.gain, at, 0.1 + Math.random() * 0.06, 0.035 + Math.random() * 0.03)
+    at += 0.07 + Math.random() * 0.08
+  }
+}
+
+/** The turbo dumping its pressure: a quick, fading hiss. */
+function blowOff(t, volume) {
+  const g = eng.bovGain.gain
+  g.cancelScheduledValues(t)
+  g.setValueAtTime(0, t)
+  g.linearRampToValueAtTime(volume, t + 0.012)
+  g.setTargetAtTime(0, t + 0.03, 0.06)
+}
+
+/**
+ * Your car's engine. `start()` once you're driving, `set()` every frame (cheap: it only
+ * re-aims the existing nodes, at most ~30 times a second), `stop()` when you leave.
+ */
+export const engine = {
+  start() {
+    engineWanted = true
+    buildEngine()
+  },
+  /**
+   * @param {number} speed01 speed as a fraction of top speed (0..1+)
+   * @param {number} throttle01 how hard you're on the gas (0..1)
+   * @param {boolean} boosting nitro on
+   */
+  set(speed01, throttle01, boosting) {
+    if (!eng) {
+      if (engineWanted && ctx) buildEngine()
+      return
+    }
+    const now = performance.now()
+    if (now - engineSetAt < 33) return
+    engineSetAt = now
+    const s = Math.min(1.3, Math.max(0, speed01))
+    let gear = 0
+    while (gear < GEARS.length - 2 && s >= GEARS[gear + 1]) gear += 1
+    const span = GEARS[gear + 1] - GEARS[gear]
+    const inGear = Math.min(1, (s - GEARS[gear]) / span)
+    const throttle = Math.min(1, Math.max(0, throttle01))
+    // Revs climb through each gear and drop back at the change; higher gears sit higher.
+    const rpm = 0.25 + inGear * 0.75 + gear * 0.06
+    const base = 42 + rpm * 78 + throttle * 6
+    const t = ctx.currentTime
+    eng.oscA.frequency.setTargetAtTime(base, t, 0.05)
+    eng.oscB.frequency.setTargetAtTime(base * 1.5, t, 0.05)
+    eng.sub.frequency.setTargetAtTime(base / 2, t, 0.05)
+    eng.filter.frequency.setTargetAtTime(380 + rpm * 900 + throttle * 900 + (boosting ? 900 : 0), t, 0.06)
+    eng.gain.gain.setTargetAtTime(0.045 + throttle * 0.055 + s * 0.02, t, 0.08)
+    eng.hissGain.gain.setTargetAtTime(boosting ? 0.07 : 0.004 + s * 0.006, t, boosting ? 0.05 : 0.2)
+    eng.hissFilter.frequency.setTargetAtTime(boosting ? 2400 : 700, t, 0.1)
+
+    // Turbo: spools toward throttle x revs, whistles higher as it spins up.
+    const spoolTarget = throttle * (0.3 + rpm * 0.7) * (boosting ? 1.2 : 1)
+    turboSpool += (spoolTarget - turboSpool) * (spoolTarget > turboSpool ? 0.1 : 0.25)
+    eng.turbo.frequency.setTargetAtTime(1500 + turboSpool * 2900 + rpm * 300, t, 0.08)
+    eng.turboGain.gain.setTargetAtTime(0.0001 + turboSpool * turboSpool * 0.011, t, 0.1)
+
+    // Upshift: the drive cuts for a beat (a dip), with a little turbo chirp on full gas.
+    if (gear !== lastGear) {
+      if (gear > lastGear && s > 0.05) {
+        const g = eng.shift.gain
+        g.cancelScheduledValues(t)
+        g.setValueAtTime(1, t)
+        g.linearRampToValueAtTime(0.28, t + 0.045)
+        g.linearRampToValueAtTime(1, t + 0.22)
+        if (throttle > 0.6 && turboSpool > 0.3) blowOff(t, 0.012 * turboSpool)
+      }
+      lastGear = gear
+    }
+
+    // Lift-off: the turbo dumps, and at high revs the exhaust sometimes pops.
+    throttlePeak = Math.max(throttle, throttlePeak * 0.88)
+    if (throttlePeak > 0.6 && throttle < 0.2) {
+      throttlePeak = 0
+      if (turboSpool > 0.35) blowOff(t, 0.022 * turboSpool)
+      if (rpm > 0.72 && now - lastPopAt > 1400 && Math.random() < 0.4) {
+        lastPopAt = now
+        backfire(t)
+      }
+    }
+  },
+  stop() {
+    engineWanted = false
+    if (!eng) return
+    const { oscA, oscB, sub, hiss, gain, hissGain, turbo, turboGain, pops, popGain, bovGain } = eng
+    eng = null
+    const t = ctx.currentTime
+    gain.gain.setTargetAtTime(0.0001, t, 0.08)
+    hissGain.gain.setTargetAtTime(0.0001, t, 0.08)
+    turboGain.gain.setTargetAtTime(0.0001, t, 0.08)
+    popGain.gain.cancelScheduledValues(t)
+    popGain.gain.setValueAtTime(0, t)
+    bovGain.gain.cancelScheduledValues(t)
+    bovGain.gain.setValueAtTime(0, t)
+    for (const n of [oscA, oscB, sub, hiss, turbo, pops]) n.stop(t + 0.5)
+  },
+}
+
+// --- ambience ----------------------------------------------------------------------------
+
+let ambienceWanted = false
+/** The bed's nodes once built (see buildAmbience). */
+let amb = null
+let ambienceSetAt = 0
+let ambAltitude = 0
+let gullTimer = 0
+
+/**
+ * The harbour around you: sea swells (noise under a low-pass, its level and brightness
+ * rolled by two slow, out-of-step LFOs so the waves never line up), a wind that rises
+ * with speed and height, and now and then a distant gull. Built once, then only steered.
+ */
+function buildAmbience() {
+  if (!ctx || amb) return
+  const t = ctx.currentTime
+  const out = ctx.createGain()
+  out.gain.value = 0.0001
+  out.gain.setTargetAtTime(1, t, 1.2)
+  out.connect(master)
+
+  const sea = ctx.createBufferSource()
+  sea.buffer = noiseBuffer
+  sea.loop = true
+  const seaFilter = ctx.createBiquadFilter()
+  seaFilter.type = 'lowpass'
+  seaFilter.frequency.value = 520
+  seaFilter.Q.value = 0.4
+  const seaGain = ctx.createGain()
+  seaGain.gain.value = 0.03
+  const swellA = ctx.createOscillator()
+  swellA.frequency.value = 0.085
+  const swellB = ctx.createOscillator()
+  swellB.frequency.value = 0.137
+  const swellDepth = ctx.createGain()
+  swellDepth.gain.value = 0.009
+  swellA.connect(swellDepth)
+  swellB.connect(swellDepth)
+  swellDepth.connect(seaGain.gain)
+  const surf = ctx.createGain()
+  surf.gain.value = 240
+  swellA.connect(surf).connect(seaFilter.frequency)
+  sea.connect(seaFilter).connect(seaGain).connect(out)
+
+  const wind = ctx.createBufferSource()
+  wind.buffer = noiseBuffer
+  wind.loop = true
+  const windFilter = ctx.createBiquadFilter()
+  windFilter.type = 'bandpass'
+  windFilter.frequency.value = 420
+  windFilter.Q.value = 0.8
+  const windGain = ctx.createGain()
+  windGain.gain.value = 0.003
+  const gust = ctx.createOscillator()
+  gust.frequency.value = 0.23
+  const gustDepth = ctx.createGain()
+  gustDepth.gain.value = 110
+  gust.connect(gustDepth).connect(windFilter.frequency)
+  wind.connect(windFilter).connect(windGain).connect(out)
+
+  sea.start(t, 0.1)
+  wind.start(t, 0.6)
+  for (const o of [swellA, swellB, gust]) o.start(t)
+  amb = { out, seaGain, swellDepth, windGain, windFilter, sources: [sea, wind, swellA, swellB, gust] }
+  scheduleGull()
+}
+
+function scheduleGull() {
+  clearTimeout(gullTimer)
+  gullTimer = setTimeout(() => {
+    if (!amb) return
+    // Gulls stay near the water: fewer of them the higher you climb.
+    if (Math.random() > ambAltitude * 0.6) gullCall()
+    scheduleGull()
+  }, 6000 + Math.random() * 9000)
+}
+
+/** A gull's "kyow": a nasal FM chirp that leaps up and falls away, 1-3 times. */
+function gullCall() {
+  if (!ready('gull')) return
+  const calls = 1 + Math.floor(Math.random() * 3)
+  const pan = Math.random() * 1.6 - 0.8
+  const k = 0.9 + Math.random() * 0.25
+  let at = 0
+  for (let i = 0; i < calls; i += 1) {
+    const pitch = k * (1 - i * 0.05)
+    whenDue(at, (t) => gullAt(t, pitch, pan))
+    at += 0.3 + Math.random() * 0.12
+  }
+}
+
+function gullAt(t, k, pan) {
+  const carrier = ctx.createOscillator()
+  carrier.type = 'sawtooth'
+  carrier.frequency.setValueAtTime(950 * k, t)
+  carrier.frequency.linearRampToValueAtTime(1650 * k, t + 0.05)
+  carrier.frequency.exponentialRampToValueAtTime(820 * k, t + 0.3)
+  const mod = ctx.createOscillator()
+  mod.frequency.value = 52
+  const modDepth = ctx.createGain()
+  modDepth.gain.value = 90 * k
+  mod.connect(modDepth).connect(carrier.frequency)
+  const filter = ctx.createBiquadFilter()
+  filter.type = 'bandpass'
+  filter.frequency.value = 1800
+  filter.Q.value = 1.6
+  const gain = ctx.createGain()
+  gain.gain.setValueAtTime(0.0001, t)
+  gain.gain.exponentialRampToValueAtTime(0.045, t + 0.03)
+  gain.gain.exponentialRampToValueAtTime(0.025, t + 0.15)
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.32)
+  carrier.connect(filter).connect(gain)
+  let tail = gain
+  if (ctx.createStereoPanner) {
+    const panner = ctx.createStereoPanner()
+    panner.pan.value = pan
+    tail = gain.connect(panner)
+  }
+  tail.connect(master)
+  tail.connect(echo)
+  carrier.start(t)
+  mod.start(t)
+  carrier.stop(t + 0.35)
+  mod.stop(t + 0.35)
+}
+
+/**
+ * The ambience bed. `start()` once the world is on screen, `set()` every frame (cheap:
+ * re-aims the existing nodes at most ~10 times a second, never allocates), `stop()`
+ * when leaving the world.
+ */
+export const ambience = {
+  start() {
+    ambienceWanted = true
+    buildAmbience()
+  },
+  /**
+   * @param {number} speed01 your speed as a fraction of top speed (0..1)
+   * @param {number} altitude01 how high you are on the course (0 = sea level, 1 = top)
+   */
+  set(speed01, altitude01) {
+    if (!amb) {
+      if (ambienceWanted && ctx) buildAmbience()
+      return
+    }
+    const now = performance.now()
+    if (now - ambienceSetAt < 100) return
+    ambienceSetAt = now
+    const s = Math.min(1, Math.max(0, speed01 || 0))
+    const a = Math.min(1, Math.max(0, altitude01 || 0))
+    ambAltitude = a
+    const t = ctx.currentTime
+    const sea = 0.03 * (1 - a * 0.75)
+    amb.seaGain.gain.setTargetAtTime(sea, t, 0.6)
+    amb.swellDepth.gain.setTargetAtTime(sea * 0.3, t, 0.6)
+    amb.windGain.gain.setTargetAtTime(0.003 + a * 0.012 + s * s * 0.045, t, 0.25)
+    amb.windFilter.frequency.setTargetAtTime(380 + s * 1400 + a * 300, t, 0.3)
+  },
+  stop() {
+    ambienceWanted = false
+    clearTimeout(gullTimer)
+    if (!amb) return
+    const { out, sources } = amb
+    amb = null
+    const t = ctx.currentTime
+    out.gain.setTargetAtTime(0.0001, t, 0.25)
+    for (const n of sources) n.stop(t + 1.2)
+  },
+}
+
+// --- tyre squeal -----------------------------------------------------------------------
+
+let squeal = null
+let skidSetAt = 0
+
+/** Tyres squealing while you drift or brake hard. `set(amount 0..1)` every frame. */
+export const skid = {
+  set(amount) {
+    if (!ctx) return
+    if (!squeal) {
+      if (amount < 0.05) return
+      const src = ctx.createBufferSource()
+      src.buffer = noiseBuffer
+      src.loop = true
+      const filter = ctx.createBiquadFilter()
+      filter.type = 'bandpass'
+      filter.frequency.value = 1700
+      filter.Q.value = 3
+      const gain = ctx.createGain()
+      gain.gain.value = 0.0001
+      src.connect(filter).connect(gain).connect(master)
+      src.start()
+      squeal = { filter, gain }
+    }
+    const now = performance.now()
+    if (now - skidSetAt < 33) return
+    skidSetAt = now
+    const a = Math.min(1, Math.max(0, amount))
+    const t = ctx.currentTime
+    squeal.gain.gain.setTargetAtTime(a * 0.06, t, 0.06)
+    squeal.filter.frequency.setTargetAtTime(1500 + a * 600, t, 0.1)
+  },
+}
+
+// --- one-shots -------------------------------------------------------------------------
+
+/** Rarity -> how lavish its reveal is. */
+const RARITY_LEVEL = { common: 0, rare: 1, epic: 2, legendary: 3, mythic: 4 }
 
 export const sfx = {
   click() {
     if (ready('click', 40)) tone(660, { type: 'triangle', duration: 0.05, volume: 0.15 })
   },
-  /** A Health gain: a bright tick, softer for the ones that trickle in while you train. */
-  gain(soft = false) {
-    if (ready('gain', 110)) tone(880 + Math.random() * 120, { type: 'triangle', duration: 0.07, volume: soft ? 0.05 : 0.07, slideTo: 1400 })
+  /** A coin: a bright two-note ding, pitch nudged each time so a row doesn't drone. */
+  coin() {
+    if (!ready('coin', 45)) return
+    const k = 1 + (Math.random() - 0.5) * 0.06
+    tone(1319 * k, { type: 'square', duration: 0.07, volume: 0.05, cutoff: 4000 })
+    tone(1976 * k, { type: 'square', at: 0.06, duration: 0.18, volume: 0.05, echo: true, cutoff: 4500 })
   },
-  levelUp() {
-    if (!ready('levelUp')) return
-    ;[523, 659, 784, 1047].forEach((f, i) => tone(f, { type: 'square', at: i * 0.07, duration: 0.14, volume: 0.09 }))
+  /** Through a checkpoint gate: a short brass-y fanfare. */
+  checkpoint() {
+    if (!ready('checkpoint', 300)) return
+    arpeggio([65, 69, 72, 77], { step: 0.08, volume: 0.07, duration: 0.18 })
+    tone(hz(77), { type: 'sawtooth', at: 0.32, duration: 0.45, volume: 0.05, cutoff: 2400 })
+    tone(hz(81), { type: 'sawtooth', at: 0.32, duration: 0.45, volume: 0.04, cutoff: 2400 })
+    bell(hz(89), { at: 0.34, volume: 0.05, decay: 0.6 })
   },
-  /** Shooting past the launch posts: a thump, a whoosh, a rising boing and a sparkle. */
-  rollStart() {
-    if (!ready('rollStart')) return
-    tone(110, { duration: 0.18, volume: 0.16, slideTo: 55 })
-    noise({ duration: 0.3, volume: 0.12, from: 220, to: 900, q: 0.8 })
-    tone(220, { type: 'triangle', duration: 0.32, volume: 0.09, slideTo: 660 })
-    bell(1319, { at: 0.2, volume: 0.05, decay: 0.3 })
+  /** Crossing the finish: a bigger fanfare, a held chord and a shower of sparkles. */
+  finish() {
+    if (!ready('finish', 1000)) return
+    duckMusic(true)
+    arpeggio([60, 64, 67, 72, 76, 79], { step: 0.09, volume: 0.07, duration: 0.2 })
+    for (const n of [72, 76, 79, 84]) tone(hz(n), { type: 'sawtooth', at: 0.6, duration: 1.4, volume: 0.03, attack: 0.05, cutoff: 2600 })
+    tone(hz(48), { type: 'triangle', at: 0.6, duration: 1.4, volume: 0.12 })
+    noise({ at: 0.55, duration: 1.2, volume: 0.05, from: 2000, to: 6000, q: 0.5 })
+    sparkle(10, { at: 0.7, base: 84 })
+    setTimeout(() => duckMusic(false), 2400)
   },
-  /**
-   * Letting go of the stretch (`power` 0-1, how far back you'd pulled): the rubber's big
-   * twang dropping in pitch, a slap, and the rush of being slung forward.
-   */
-  rubberSnap(power = 1) {
-    if (!ready('rubberSnap', 250)) return
-    tone(520 + 300 * power, { type: 'triangle', duration: 0.32, volume: 0.17, slideTo: 130 })
-    tone(260 + 120 * power, { type: 'sawtooth', duration: 0.14, volume: 0.05, slideTo: 90 })
-    noise({ duration: 0.05, volume: 0.25, from: 2400, to: 900, q: 1.2 })
-    noise({ at: 0.06, duration: 0.4, volume: 0.1 * (0.5 + power * 0.5), from: 300, to: 2600, q: 0.7 })
+  /** The car spin's reel ticking past a car. */
+  spinTick() {
+    if (ready('spinTick', 30)) tone(1250 + Math.random() * 80, { type: 'triangle', duration: 0.03, volume: 0.09 })
   },
-  /** A referee's whistle: a pea-whistle's trilling blast, two of them when `long`. */
-  whistle(long = false) {
-    if (!ready('whistle', 250)) return
-    const blasts = long ? [[0, 0.16], [0.24, 0.5]] : [[0, 0.24]]
-    for (const [at, length] of blasts) {
-      const t = ctx.currentTime + at
-      const osc = ctx.createOscillator()
-      osc.frequency.value = 2850
-      // The pea rattling in the whistle: a fast warble.
-      const pea = ctx.createOscillator()
-      pea.type = 'square'
-      pea.frequency.value = 32
-      const depth = ctx.createGain()
-      depth.gain.value = 150
-      pea.connect(depth).connect(osc.frequency)
-      const gain = ctx.createGain()
-      gain.gain.setValueAtTime(0.0001, t)
-      gain.gain.exponentialRampToValueAtTime(0.07, t + 0.015)
-      gain.gain.setValueAtTime(0.07, t + length - 0.04)
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + length)
-      osc.connect(gain).connect(master)
-      gain.connect(echo)
-      osc.start(t)
-      pea.start(t)
-      osc.stop(t + length + 0.02)
-      pea.stop(t + length + 0.02)
+  /** The spin landing: more lavish the rarer the car. */
+  spinWin(rarity = 'common') {
+    if (!ready('spinWin', 400)) return
+    const level = RARITY_LEVEL[rarity] ?? 0
+    if (level === 0) {
+      bell(hz(79), { volume: 0.08 })
+      bell(hz(84), { at: 0.1, volume: 0.08 })
+      return
+    }
+    if (level >= 3) duckMusic(true)
+    const notes = [[67, 72, 76], [67, 72, 76, 79], [65, 69, 72, 77, 81], [60, 64, 67, 72, 76, 79, 84], [60, 64, 67, 71, 74, 79, 83, 86]][level]
+    arpeggio(notes, { step: 0.07 - level * 0.006, volume: 0.06 })
+    const end = notes.length * 0.065
+    if (level >= 2) sparkle(4 + level * 2, { at: end, base: 84, volume: 0.035 })
+    if (level >= 3) {
+      for (const n of notes.slice(-3)) tone(hz(n), { type: 'sawtooth', at: end, duration: 1.1, volume: 0.03, attack: 0.04, cutoff: 2800 })
+      noise({ at: end - 0.1, duration: 1.0, volume: 0.05, from: 1500, to: 7000, q: 0.5 })
+      setTimeout(() => duckMusic(false), 2000)
+    }
+    if (level >= 4) {
+      tone(hz(36), { type: 'sawtooth', at: 0, duration: end + 0.3, volume: 0.05, slideTo: hz(60), cutoff: 1500 })
+      arpeggio([84, 88, 91, 96], { at: end + 0.5, step: 0.06, volume: 0.04, type: 'triangle' })
     }
   },
-  /**
-   * You belly-flopping onto the turf from the top of the arc (`power` 0-1, how high you
-   * fell): a deep, soft thud, a rubbery bounce, a short scuff of grass, and a few clods of
-   * soil pattering down - the crowd roaring over it.
-   */
-  groundSmash(power = 1) {
-    if (!ready('groundSmash', 400)) return
-    liveCrowd()?.roar(0.5 + 0.5 * power)
-    const p = 0.6 + 0.4 * power
-    tone(95, { duration: 0.6, volume: 0.32 * p, slideTo: 32 })
-    tone(190, { type: 'triangle', duration: 0.14, volume: 0.1 * p, slideTo: 95 })
-    noise({ duration: 0.14, volume: 0.16 * p, from: 900, to: 280, q: 0.8 })
-    for (let i = 0; i < 5; i += 1) {
-      tone(300 + Math.random() * 220, { type: 'triangle', at: 0.14 + i * 0.07 + Math.random() * 0.04, duration: 0.04, volume: 0.03 * p, slideTo: 190 })
-    }
-  },
-  /** Bouncing on after you land (`n` 1, 2, 3...): a thud and a boing, softer each time. */
-  bounce(n = 1) {
-    if (!ready('bounce', 120)) return
-    const v = 0.16 / n
-    tone(150, { duration: 0.16, volume: v, slideTo: 60 })
-    tone(1250 - n * 90, { duration: 0.04, volume: v * 0.7, slideTo: 900 })
-  },
-  /** A cartoon falling whistle over `duration` seconds, as you drop from the top of the arc. */
-  fallWhistle(duration = 1.5) {
-    if (!ready('fallWhistle', 300) || duration < 0.3) return
-    tone(1800, { duration, volume: 0.045, slideTo: 420, attack: Math.min(0.3, duration * 0.2) })
-  },
-  /**
-   * A PERFECT launch: a crack of the rubber, fire bursting up with a deep fwoosh and a
-   * crackle, and a bright chime climbing up.
-   */
-  perfectHit() {
-    if (!ready('perfectHit', 300)) return
-    tone(2200, { duration: 0.04, volume: 0.2, slideTo: 1400 })
-    noise({ duration: 0.25, volume: 0.1, from: 500, to: 2400, q: 0.9 })
-    noise({ duration: 0.5, volume: 0.16, from: 160, to: 600, q: 0.6 })
-    tone(90, { duration: 0.5, volume: 0.14, slideTo: 160 })
-    for (let i = 0; i < 6; i += 1) noise({ at: 0.1 + i * 0.07 + Math.random() * 0.04, duration: 0.04, volume: 0.07, from: 3800, to: 2600, q: 2 })
-    ;[784, 1047, 1319, 1568, 2093].forEach((f, i) => bell(f, { at: 0.04 + i * 0.05, volume: 0.07, decay: 0.35 }))
-  },
-  /**
-   * A good launch blasting you away as time snaps back (`power` 0-1, the grade's): a deep
-   * boom and a rising whoosh.
-   */
-  perfectRelease(power = 1) {
-    if (!ready('perfectRelease', 300)) return
-    tone(70, { duration: 0.6, volume: 0.3 * power, slideTo: 32 })
-    noise({ duration: 0.3, volume: 0.12 * power, from: 250, to: 1800, q: 0.7 })
-    tone(440, { type: 'triangle', duration: 0.35, volume: 0.06 * power, slideTo: 1760 })
-  },
-  /** Shooting past the posts on a graded launch: its own sound for each grade. */
-  gradeHit(grade) {
-    if (grade === 'perfect') return sfx.perfectHit()
-    if (!ready('gradeHit', 300)) return
-    if (grade === 'great') {
-      // An electric crack, a zap and a rising chime.
-      tone(1800, { type: 'square', duration: 0.05, volume: 0.1, slideTo: 600 })
-      noise({ duration: 0.16, volume: 0.1, from: 1800, to: 4000, q: 1.4 })
-      ;[659, 988, 1319].forEach((f, i) => bell(f, { at: 0.03 + i * 0.05, volume: 0.07, decay: 0.3 }))
-    } else {
-      // A clean, bright tok and a sparkle.
-      tone(1500, { duration: 0.05, volume: 0.18, slideTo: 1050 })
-      bell(1568, { at: 0.03, volume: 0.06, decay: 0.25 })
-      bell(2093, { at: 0.08, volume: 0.05, decay: 0.25 })
-    }
-  },
-  /** A WEAK launch: a dull, soft flop off a slack rubber band. */
-  weakHit() {
-    if (!ready('weakHit', 300)) return
-    tone(320, { duration: 0.12, volume: 0.12, slideTo: 140 })
-    tone(180, { type: 'triangle', at: 0.08, duration: 0.18, volume: 0.06, slideTo: 90 })
-  },
-  /** The ball dropping onto the tee in front of you when you press KICK: a springy bloop. */
-  tirePop() {
-    if (!ready('tirePop', 200)) return
-    tone(420, { type: 'sine', duration: 0.16, volume: 0.14, slideTo: 980 })
-    tone(1320, { type: 'triangle', at: 0.08, duration: 0.1, volume: 0.06 })
-  },
-  /** Flying off a ramp: a rising rush of air. */
-  jumpWhoosh() {
-    if (ready('jumpWhoosh', 250)) noise({ duration: 0.25, volume: 0.08, from: 300, to: 1200, q: 0.9 })
-  },
-  /** The tire slapping back down after a jump: a thump and a crunch of gravel. */
-  tireLand() {
-    if (!ready('tireLand', 250)) return
-    tone(160, { type: 'sine', duration: 0.2, volume: 0.18, slideTo: 55 })
-    noise({ duration: 0.24, volume: 0.13, from: 2400, to: 300, q: 0.6 })
-  },
-  /**
-   * The tire smashing through a wooden wall: a crunch of splintering noise over a low
-   * thump, then a few high clattering clicks of falling planks (~0.4 s).
-   */
-  wallSmash(combo = 1) {
-    if (!ready('wallSmash', 120)) return
-    // The hit: a deep boom and a sharp wooden crack.
-    tone(95, { duration: 0.26, volume: 0.24, slideTo: 40 })
-    noise({ duration: 0.08, volume: 0.4, from: 5200, to: 1800, q: 0.6 })
-    noise({ duration: 0.22, volume: 0.32, from: 3200, to: 700, q: 0.7 })
-    noise({ duration: 0.4, volume: 0.12, from: 900, to: 260, q: 1.1 })
-    // The pieces raining down: a clatter of little wooden clicks.
-    for (let i = 0; i < 9; i += 1) {
-      tone(1200 + Math.random() * 2200, { type: 'square', at: 0.08 + i * 0.045 + Math.random() * 0.03, duration: 0.025, volume: 0.035 })
-    }
-    // A bright 'ding' that climbs with every wall smashed in a row: the combo.
-    const step = Math.min(combo - 1, 10)
-    const f = 523 * Math.pow(2, (step * 2) / 12)
-    tone(f, { type: 'triangle', at: 0.04, duration: 0.18, volume: 0.09, echo: true })
-    tone(f * 1.5, { type: 'triangle', at: 0.1, duration: 0.22, volume: 0.06, echo: true })
-  },
-  /** A new stage reached mid-roll: a quick, cheerful rising jingle. */
-  stageUp() {
-    if (!ready('stageUp', 300)) return
-    liveCrowd()?.whoo(2)
-    ;[659, 784, 988, 1319].forEach((f, i) => tone(f, { type: 'triangle', at: i * 0.06, duration: 0.16, volume: 0.08, echo: true }))
-    for (let i = 0; i < 3; i += 1) bell(1760 + Math.random() * 900, { at: 0.24 + i * 0.05, volume: 0.03, decay: 0.18 })
-  },
-  /** Trophies landing in the Wins counter: little coin pings, one after another. */
-  coins(count = 8) {
-    if (!ready('coins', 400)) return
-    for (let i = 0; i < count; i += 1) bell(1900 + (i % 4) * 230, { at: 0.55 + i * 0.07, volume: 0.04, decay: 0.12 })
-  },
-  /** The tire hitting a wall it can't break: a dull, heavy thud and a short low boing (~0.35 s). */
-  wallBlock() {
-    if (!ready('wallBlock', 150)) return
-    tone(70, { duration: 0.28, volume: 0.24, slideTo: 38 })
-    noise({ duration: 0.12, volume: 0.14, from: 500, to: 150, q: 0.9 })
-    tone(150, { type: 'triangle', at: 0.05, duration: 0.3, volume: 0.07, slideTo: 95 })
-  },
-  /**
-   * A trophy rolled through: a bell that climbs the scale and back down while they keep
-   * coming, so a run of them plays a little tune.
-   */
-  trophy() {
-    if (!ready('trophy', 90)) return
-    const now = performance.now()
-    trophyRun = now - trophyAt < TROPHY_RUN_MS ? trophyRun + 1 : 0
-    trophyAt = now
-    const n = TROPHY_SCALE.length
-    const k = trophyRun % (2 * n - 2)
-    const f = TROPHY_SCALE[k < n ? k : 2 * n - 2 - k]
-    // LOW: one note, not a three-voice bell (they come many a second).
-    if (lite()) tone(f, { duration: 0.22, volume: 0.085 })
-    else bell(f, { volume: 0.085, decay: 0.32 })
-  },
-  /** Wins paid out (a roll's total, a badge): a fanfare, a shimmering chord and a shower of coins. */
-  wins() {
-    if (!ready('wins')) return
-    liveCrowd()?.applause()
-    ;[784, 988, 1175, 1568].forEach((f, i) => tone(f, { type: 'triangle', at: i * 0.07, duration: 0.2, volume: 0.1, echo: true }))
-    // G major, held, each voice doubled a hair apart so it shimmers.
-    for (const f of [784, 988, 1175]) {
-      tone(f * 1.003, { at: 0.28, duration: 0.9, volume: 0.045, attack: 0.05, echo: true })
-      tone(f * 0.997, { at: 0.28, duration: 0.9, volume: 0.045, attack: 0.05 })
-    }
-    for (let i = 0; i < 6; i += 1) bell(2093 + Math.random() * 1200, { at: 0.3 + i * 0.07 + Math.random() * 0.03, volume: 0.035, decay: 0.2 })
-  },
-  crack() {
-    if (!ready('crack', 150)) return
-    noise({ duration: 0.12, volume: 0.35, from: 1800, to: 600, q: 0.8 })
-    tone(220, { type: 'square', duration: 0.08, volume: 0.08, slideTo: 90 })
-  },
-  reveal() {
-    if (!ready('reveal')) return
-    ;[392, 523, 659, 784, 1047].forEach((f, i) => tone(f, { type: 'triangle', at: i * 0.06, duration: 0.22, volume: 0.12 }))
-  },
+  /** Bought something: a register bell and a tick. */
   buy() {
-    if (!ready('buy')) return
-    tone(1047, { type: 'square', duration: 0.07, volume: 0.08 })
-    tone(1568, { type: 'square', at: 0.08, duration: 0.16, volume: 0.08 })
+    if (!ready('buy', 120)) return
+    bell(1568, { volume: 0.08, decay: 0.35 })
+    bell(2093, { at: 0.08, volume: 0.07, decay: 0.45 })
+    noise({ duration: 0.05, volume: 0.06, from: 4000, to: 3000, q: 2 })
   },
   error() {
-    if (ready('error', 200)) tone(160, { type: 'sawtooth', duration: 0.18, volume: 0.07, slideTo: 110 })
+    if (!ready('error', 200)) return
+    tone(160, { type: 'square', duration: 0.13, volume: 0.06, cutoff: 1200 })
+    tone(120, { type: 'square', at: 0.13, duration: 0.18, volume: 0.06, cutoff: 1200 })
   },
-  rebirth() {
-    if (!ready('rebirth')) return
-    sfx.whistle(true)
-    liveCrowd()?.roar(1)
-    noise({ duration: 0.5, volume: 0.07, from: 200, to: 1800, q: 0.6 })
-    ;[262, 330, 392, 523, 659, 784].forEach((f, i) => tone(f, { type: 'sawtooth', at: 0.1 + i * 0.07, duration: 0.25, volume: 0.06 }))
+  /** Picked up an item crate: a quick sparkle up. */
+  item() {
+    if (!ready('item', 100)) return
+    sparkle(4, { base: 79, volume: 0.05 })
   },
-  /** Grabbing an unlocked pull-up bar: a soft rising chime, and the reps start. */
-  treadmillEnter() {
-    if (!ready('treadmillEnter', 400)) return
-    ;[523, 784, 1047].forEach((f, i) => tone(f, { type: 'sine', at: i * 0.05, duration: 0.28, volume: 0.07 }))
-    treadmillStart()
+  /** Used an item: a whoosh up and a pop. */
+  itemUse() {
+    if (!ready('itemUse', 150)) return
+    noise({ duration: 0.25, volume: 0.1, from: 400, to: 3200, q: 1 })
+    tone(330, { type: 'triangle', duration: 0.22, volume: 0.09, slideTo: 990 })
+    tone(1320, { type: 'sine', at: 0.2, duration: 0.08, volume: 0.06 })
   },
-  treadmillStop,
-  /** A jump: a springy little boing. */
-  jump() {
-    if (ready('jump', 120)) tone(260, { type: 'triangle', duration: 0.18, volume: 0.1, slideTo: 620 })
+  /** A Rocket Missile leaving the rail: a hiss and a rising whoosh. */
+  missileLaunch() {
+    if (!ready('missileLaunch', 120)) return
+    noise({ duration: 0.55, volume: 0.13, from: 900, to: 5200, q: 0.8, attack: 0.04 })
+    tone(170, { type: 'sawtooth', duration: 0.4, volume: 0.06, slideTo: 520, cutoff: 1600 })
   },
-  /** Landing from a jump: a soft thump. */
-  jumpLand() {
-    if (!ready('jumpLand', 150)) return
-    tone(140, { type: 'sine', duration: 0.12, volume: 0.12, slideTo: 70 })
-    noise({ duration: 0.08, volume: 0.06, from: 900, to: 300, q: 0.7 })
+  /** A missile blowing up; `volume` 0..1 (distance). A low boom and a crackle. */
+  explosion(volume = 1) {
+    const k = Math.min(1, Math.max(0.1, volume))
+    if (!ready('explosion', 90)) return
+    tone(95, { duration: 0.5, volume: 0.22 * k, slideTo: 32 })
+    noise({ duration: 0.7, volume: 0.2 * k, from: 2200, to: 220, q: 0.6, attack: 0.02 })
+    noise({ duration: 0.25, volume: 0.08 * k, from: 6000, to: 2500, q: 0.8, attack: 0.02 })
   },
-  /**
-   * Settling at the end of your bounces: two soft thuds on the turf, the second smaller.
-   */
-  rollStop() {
-    if (!ready('rollStop')) return
-    tone(120, { duration: 0.16, volume: 0.1, slideTo: 55 })
-    tone(140, { at: 0.22, duration: 0.12, volume: 0.05, slideTo: 70 })
+  /** Over a boost pad: a rising rush. */
+  boostPad() {
+    if (!ready('boostPad', 250)) return
+    noise({ duration: 0.45, volume: 0.13, from: 300, to: 3500, q: 0.9 })
+    tone(140, { type: 'sawtooth', duration: 0.4, volume: 0.05, slideTo: 420, cutoff: 1800 })
   },
-  windStart,
-  windSet,
-  windStop,
-  stretchStart,
-  stretchSet,
-  stretchStop,
+  /** A bounce pad: a cartoon boing. */
+  bounce() {
+    if (!ready('bounce', 200)) return
+    whenDue(0, (t) => {
+      const osc = ctx.createOscillator()
+      const lfo = ctx.createOscillator()
+      const lfoGain = ctx.createGain()
+      const gain = ctx.createGain()
+      osc.type = 'triangle'
+      osc.frequency.setValueAtTime(160, t)
+      osc.frequency.exponentialRampToValueAtTime(520, t + 0.35)
+      lfo.frequency.value = 22
+      lfoGain.gain.value = 40
+      lfo.connect(lfoGain).connect(osc.frequency)
+      gain.gain.setValueAtTime(0.0001, t)
+      gain.gain.exponentialRampToValueAtTime(0.16, t + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.45)
+      osc.connect(gain).connect(master)
+      osc.start(t)
+      lfo.start(t)
+      osc.stop(t + 0.47)
+      lfo.stop(t + 0.47)
+    })
+  },
+  /** Over a spike strip: a sharp pop, a hiss of escaping air and a rattle. */
+  puncture() {
+    if (!ready('puncture', 300)) return
+    tone(190, { type: 'square', duration: 0.07, volume: 0.1, slideTo: 70, cutoff: 2200 })
+    noise({ duration: 0.5, volume: 0.09, from: 7000, to: 2500, q: 0.7, attack: 0.02 })
+    for (let i = 0; i < 3; i += 1) tone(600 + i * 120, { type: 'triangle', at: 0.06 + i * 0.07, duration: 0.05, volume: 0.04, slideTo: 300 })
+  },
+  /** A hit: a metal thud and clang, scaled by `intensity` 0..1. */
+  crash(intensity = 0.5) {
+    const k = Math.min(1, Math.max(0.05, intensity))
+    if (!ready('crash', 110)) return
+    tone(110 + k * 30, { duration: 0.18 + k * 0.15, volume: 0.1 + k * 0.15, slideTo: 40 })
+    noise({ duration: 0.12 + k * 0.2, volume: 0.06 + k * 0.12, from: 1800, to: 400, q: 0.8, attack: 0.05 })
+    if (k > 0.35) {
+      // A clang: two inharmonic partials ringing briefly.
+      tone(287 * (1 + Math.random() * 0.1), { type: 'square', duration: 0.22 * k + 0.05, volume: 0.03 * k, cutoff: 2500 })
+      tone(431, { type: 'triangle', duration: 0.3 * k + 0.05, volume: 0.04 * k, echo: true })
+    }
+  },
+  /** Into the sea: a big splash and a few bubbles. */
+  splash() {
+    if (!ready('splash', 400)) return
+    noise({ duration: 0.7, volume: 0.2, from: 2500, to: 260, q: 0.6, attack: 0.04 })
+    noise({ duration: 0.3, volume: 0.1, from: 6000, to: 3000, q: 0.8, attack: 0.05 })
+    for (let i = 0; i < 4; i += 1) tone(300 + Math.random() * 300, { at: 0.25 + i * 0.09, duration: 0.07, volume: 0.05, slideTo: 900 + Math.random() * 400 })
+  },
+  /** Landed a trick. */
+  trick() {
+    if (!ready('trick', 200)) return
+    tone(523, { type: 'square', duration: 0.12, volume: 0.05, slideTo: 1046, cutoff: 3000 })
+    bell(1568, { at: 0.1, volume: 0.07 })
+    bell(2093, { at: 0.18, volume: 0.06 })
+  },
+  /** Touching down from a jump. */
+  land() {
+    if (!ready('land', 150)) return
+    tone(95, { duration: 0.16, volume: 0.16, slideTo: 48 })
+    noise({ duration: 0.12, volume: 0.06, from: 900, to: 300, q: 0.7, attack: 0.05 })
+  },
+  /** The dock truck's two-tone air horn. */
+  horn() {
+    if (!ready('horn', 450)) return
+    for (const f of [233, 294]) {
+      tone(f, { type: 'sawtooth', duration: 0.42, volume: 0.05, attack: 0.03, cutoff: 1400 })
+      tone(f * 1.005, { type: 'square', duration: 0.42, volume: 0.025, attack: 0.03, cutoff: 1100 })
+    }
+  },
+  /** Respawned at the checkpoint: a reverse whoosh and a chime. */
+  respawn() {
+    if (!ready('respawn', 300)) return
+    noise({ duration: 0.35, volume: 0.09, from: 3500, to: 500, q: 0.8, attack: 0.8 })
+    bell(hz(84), { at: 0.3, volume: 0.06 })
+  },
+  /** A countdown beep. */
+  countdown() {
+    if (ready('countdown', 120)) tone(880, { type: 'square', duration: 0.12, volume: 0.06, cutoff: 3000 })
+  },
+  /** Nitro lit: an ignition whump and a whoosh (the engine adds the sustained hiss). */
+  nitroStart() {
+    if (!ready('nitroStart', 200)) return
+    tone(90, { duration: 0.2, volume: 0.14, slideTo: 55 })
+    noise({ duration: 0.4, volume: 0.12, from: 600, to: 4200, q: 0.9, attack: 0.1 })
+  },
+  /** Nitro out: a soft puff. */
+  nitroStop() {
+    if (!ready('nitroStop', 200)) return
+    noise({ duration: 0.25, volume: 0.06, from: 1800, to: 300, q: 0.7, attack: 0.1 })
+  },
+  /** Rushing past an obstacle or through a gate; `intensity` 0..1 (closeness x speed). */
+  whoosh(intensity = 0.5) {
+    const k = Math.min(1, Math.max(0.05, intensity))
+    if (!ready('whoosh', 90)) return
+    const d = 0.22 + k * 0.18
+    noise({ duration: d, volume: 0.03 + k * 0.09, from: 350 + k * 250, to: 1800 + k * 1600, q: 1.1, attack: 0.55 })
+    noise({ at: d * 0.5, duration: d * 0.8, volume: 0.02 + k * 0.04, from: 2200, to: 500, q: 0.9, attack: 0.15 })
+  },
+  /** A fan's gust hitting the car: a swelling, airy rush. */
+  wind() {
+    if (!ready('wind', 400)) return
+    noise({ duration: 0.9, volume: 0.1, from: 260, to: 1100, q: 0.7, attack: 0.35 })
+    noise({ at: 0.1, duration: 0.7, volume: 0.035, from: 2600, to: 1500, q: 1.4, attack: 0.4 })
+    tone(180, { type: 'sine', duration: 0.6, volume: 0.02, slideTo: 120, attack: 0.2 })
+  },
+  /** A hydraulic piston punching out: a thud and a clank, then the hiss of its release. */
+  piston() {
+    if (!ready('piston', 150)) return
+    tone(92, { duration: 0.16, volume: 0.15, slideTo: 44 })
+    tone(212 * (1 + Math.random() * 0.06), { type: 'square', duration: 0.14, volume: 0.035, cutoff: 2200 })
+    tone(587, { type: 'triangle', duration: 0.22, volume: 0.03, echo: true })
+    noise({ at: 0.06, duration: 0.32, volume: 0.07, from: 6500, to: 2800, q: 0.6, type: 'highpass', attack: 0.04 })
+  },
+  /** A drawbridge moving: a strained wooden creak, then a heavy clunk as it settles. */
+  bridge() {
+    if (!ready('bridge', 600)) return
+    whenDue(0, (t) => {
+      const osc = ctx.createOscillator()
+      osc.type = 'sawtooth'
+      osc.frequency.setValueAtTime(78, t)
+      osc.frequency.linearRampToValueAtTime(104, t + 0.35)
+      osc.frequency.linearRampToValueAtTime(70, t + 0.65)
+      const wobble = ctx.createOscillator()
+      wobble.frequency.value = 13
+      const wobbleDepth = ctx.createGain()
+      wobbleDepth.gain.value = 9
+      wobble.connect(wobbleDepth).connect(osc.frequency)
+      const filter = ctx.createBiquadFilter()
+      filter.type = 'bandpass'
+      filter.frequency.value = 620
+      filter.Q.value = 5
+      const gain = ctx.createGain()
+      gain.gain.setValueAtTime(0.0001, t)
+      gain.gain.exponentialRampToValueAtTime(0.09, t + 0.12)
+      gain.gain.exponentialRampToValueAtTime(0.05, t + 0.5)
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.7)
+      osc.connect(filter).connect(gain).connect(master)
+      osc.start(t)
+      wobble.start(t)
+      osc.stop(t + 0.72)
+      wobble.stop(t + 0.72)
+    })
+    tone(70, { at: 0.68, duration: 0.25, volume: 0.17, slideTo: 36 })
+    noise({ at: 0.68, duration: 0.18, volume: 0.07, from: 1400, to: 300, q: 0.8, attack: 0.05 })
+    tone(331, { type: 'square', at: 0.7, duration: 0.16, volume: 0.025, cutoff: 1800 })
+  },
+  /** Onto a conveyor: a low mechanical rumble with a rattle. */
+  conveyor() {
+    if (!ready('conveyor', 400)) return
+    noise({ duration: 0.65, volume: 0.09, from: 140, to: 220, q: 0.9, type: 'lowpass', attack: 0.2 })
+    whenDue(0, (t) => {
+      const osc = ctx.createOscillator()
+      osc.type = 'square'
+      osc.frequency.value = 46
+      const rattle = ctx.createOscillator()
+      rattle.type = 'square'
+      rattle.frequency.value = 17
+      const rattleDepth = ctx.createGain()
+      rattleDepth.gain.value = 0.5
+      const gain = ctx.createGain()
+      gain.gain.setValueAtTime(0.0001, t)
+      gain.gain.exponentialRampToValueAtTime(0.03, t + 0.08)
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.6)
+      const vca = ctx.createGain()
+      vca.gain.value = 0.5
+      rattle.connect(rattleDepth).connect(vca.gain)
+      const filter = ctx.createBiquadFilter()
+      filter.type = 'lowpass'
+      filter.frequency.value = 380
+      osc.connect(filter).connect(vca).connect(gain).connect(master)
+      osc.start(t)
+      rattle.start(t)
+      osc.stop(t + 0.62)
+      rattle.stop(t + 0.62)
+    })
+  },
+  /** A cargo door giving itself away: a relay clunk, then a roller shutter rattling up. */
+  shutter() {
+    if (!ready('shutter', 500)) return
+    tone(140, { duration: 0.08, volume: 0.08, slideTo: 90 })
+    tone(392, { type: 'square', at: 0.02, duration: 0.06, volume: 0.02, cutoff: 1800 })
+    for (let i = 0; i < 7; i += 1) {
+      noise({ at: 0.1 + i * 0.055, duration: 0.05, volume: 0.05, from: 2600, to: 1400, q: 1.6, attack: 0.1 })
+    }
+  },
+  /** A giant hammer sweeping through the bottom of its swing: a deep rush of air and a creak of the axle. */
+  hammer() {
+    if (!ready('hammer', 400)) return
+    noise({ duration: 0.55, volume: 0.1, from: 180, to: 900, q: 0.8, attack: 0.45 })
+    noise({ at: 0.2, duration: 0.35, volume: 0.04, from: 1600, to: 400, q: 1, attack: 0.2 })
+    tone(64, { duration: 0.4, volume: 0.05, slideTo: 48, attack: 0.3 })
+  },
+  /** A forklift setting off: two short reversing beeps. */
+  forklift() {
+    if (!ready('forklift', 700)) return
+    tone(1240, { type: 'square', duration: 0.12, volume: 0.025, cutoff: 3200 })
+    tone(1240, { type: 'square', at: 0.24, duration: 0.12, volume: 0.025, cutoff: 3200 })
+  },
+  /** A checkpoint split: a bright rising pair if faster than your best, a soft fall if slower. */
+  split(faster = true) {
+    if (!ready('split', 300)) return
+    if (faster) {
+      bell(hz(88), { volume: 0.07, decay: 0.3 })
+      bell(hz(93), { at: 0.09, volume: 0.07, decay: 0.45 })
+    } else {
+      tone(hz(69), { type: 'triangle', duration: 0.16, volume: 0.07 })
+      tone(hz(65), { type: 'triangle', at: 0.13, duration: 0.28, volume: 0.06 })
+    }
+  },
+  /** Climbed a place on the leaderboard: a quick rising run and a sparkle. */
+  rankUp() {
+    if (!ready('rankUp', 400)) return
+    arpeggio([72, 76, 79, 84], { step: 0.06, volume: 0.055, duration: 0.14 })
+    sparkle(5, { at: 0.24, base: 84, volume: 0.035 })
+  },
+  /** Entering a new section: a short two-chord brass sting. */
+  section() {
+    if (!ready('section', 800)) return
+    for (const n of [65, 69, 72]) tone(hz(n), { type: 'sawtooth', duration: 0.2, volume: 0.03, attack: 0.01, cutoff: 2200 })
+    for (const n of [70, 74, 77]) tone(hz(n), { type: 'sawtooth', at: 0.16, duration: 0.5, volume: 0.03, attack: 0.02, cutoff: 2400 })
+    tone(hz(46), { type: 'triangle', at: 0.16, duration: 0.45, volume: 0.08 })
+    bell(hz(89), { at: 0.18, volume: 0.045, decay: 0.5 })
+  },
 }
-
-// The template's names, kept as aliases while callers move over to the tire ones.
-sfx.slideStart = sfx.rollStart
-sfx.slideStop = sfx.rollStop
-sfx.boardPop = sfx.tirePop
-sfx.boardLand = sfx.tireLand

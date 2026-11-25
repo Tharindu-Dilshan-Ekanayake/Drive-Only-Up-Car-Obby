@@ -46,7 +46,7 @@ export const asGuestId = (id) => (id.startsWith('guest-') ? id : `guest-${id}`).
  * - If Boxity can't be reached, the player still gets in, as a guest (see above), so
  *   an outage on the platform doesn't lock everyone out of the game.
  *
- * Only `verified` players count for Boxity leaderboards and receive Gems purchases.
+ * Only `verified` players count for Boxity leaderboards.
  */
 export async function resolveIdentity(options, { fetchImpl = fetch, settings = bloxity } = {}) {
   const claimed = String(options?.playerId || '').trim().slice(0, MAX_ID)
