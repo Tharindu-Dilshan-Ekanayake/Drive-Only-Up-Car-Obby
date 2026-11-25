@@ -1,23 +1,33 @@
 import { create } from 'zustand'
 
-import { SPHINX_STOCK_DEFAULT } from '@shared/balance'
-import { createProfile, createSession } from '@shared/logic'
+import { createProfile } from '@shared/logic'
+import { ROOM_CAPACITY } from '@shared/poseCodec'
+import { DEFAULT_STAGE, validStageId } from '@shared/stages/index'
+
+/** The map to start on: Sky Docks, or `?map=<id>` in the URL (testing, links). */
+const startStage = () => validStageId(typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('map') : DEFAULT_STAGE)
 
 /**
- * Everything the UI renders from. Written by the network layer (profile, events) and
- * the 10 Hz game ticker (zones, timers) - never from a frame loop.
+ * Everything the UI renders from. Written by the network layer (profile, events), the
+ * 10 Hz game ticker and the player controller's events - never from inside a frame
+ * loop (they defer with setTimeout / queue for the ticker).
  *
- * Components must select narrowly (`useGame((s) => s.profile.wins)`), so a Health tick
- * re-renders the Health label and nothing else.
+ * Components must select narrowly (`useGame((s) => s.profile.coins)`).
+ *
+ * Per-frame values (speed, altitude, nitro, timer) are NOT here: they live in
+ * `runtime` (game/runtime.js) and the HUD writes them to the DOM directly.
  */
-
-
-export const useGame = create((set, get) => ({
-  /** Authoritative copy of the player's save, as last sent by the server. */
+export const useGame = create((set) => ({
+  /**
+   * Authoritative copy of the player's save, as last sent by the authority. Shape:
+   * `{ id, name, coins, cars: string[], car, slots (1-3),
+   *    maps: { [stageId]: { checkpoint, best: { checkpoint, altitude, finishMs }, splits: { [cp]: ms }, pearls } },
+   *    unlocks: string[] (chapters opened for good),
+   *    stats: { totalCoins, finishes, tricks, spins, falls, playtime }, pity,
+   *    settings: { music, sfx, ghost, sunset }, createdAt, lastSeen }`
+   * The current map's progress: `progressOf(profile, stageId)` (game/stageRuntime.js useMapProgress).
+   */
   profile: createProfile('local', 'Player'),
-  /** Per-connection state: session start, claimed playtime rewards. */
-  session: createSession(Date.now()),
-  /** True once the first real profile has arrived. */
   profileLoaded: false,
   /** True once the game is on screen; non-essential start-up work waits for it. */
   playable: false,
@@ -26,72 +36,96 @@ export const useGame = create((set, get) => ({
     /** 'connecting' | 'online' | 'offline' */
     mode: 'connecting',
     lobbyId: null,
-    /** Short code friends join with, for private lobbies. */
     code: null,
     isPrivate: false,
     players: 1,
-    maxPlayers: 8,
+    maxPlayers: ROOM_CAPACITY,
     message: null,
   },
-  sphinxStock: SPHINX_STOCK_DEFAULT,
+  /** `{ altitude: [{ name, score }], coins: [...], finishes: [...], playtime: [...], updatedAt }` */
   leaderboards: null,
 
-  /** Where the player is standing, from the ticker. */
-  zone: { pad: -1, padNear: -1, rollZone: false, atPosts: false, stand: -1, egg: null, portal: null, freeReward: false, sphinx: false },
+  /** The map you're on (shared/stages/index.js id): its lobby theme, Start gate, room and progress. */
+  stageId: startStage(),
+  /** That map's built stage once loaded (game/stageRuntime.js), null while loading. Never mutated. */
+  stage: null,
+  /** True once the stage's track is built and drivable (the Start gate opens). */
+  stageReady: false,
+  /**
+   * True once that stage's GPU work is done behind the loading screen - every program
+   * linked, buffer uploaded, driver variant built (game/StageWarmup.jsx) - so nothing on
+   * the map costs a frame the first time it's seen. Ends the loading screen (start-up and travel).
+   */
+  stageWarm: false,
+  /**
+   * How far the current map's track is from ready (0-1) while it's prepared in the
+   * background (game/stageRuntime.js loadCurrentStage, game/StageWarmup.jsx): the timer
+   * plate's "PREPARING TRACK n%". Set at a few milestones, never per frame.
+   */
+  trackPrep: 0,
+  /** Travelling to another map: `{ to, from, progress (0-1), id }`, null otherwise (the loading screen). */
+  travel: null,
 
-  /** Which modal panel is open: 'rebirth' | 'daily' | 'pets' | 'items' | 'store' | ... */
+  /**
+   * Item slots, client-side: `[itemId | null, itemId | null, itemId | null]`.
+   * Only the first `profile.slots` are usable. Item ids: game/player/items.js ITEMS.
+   */
+  items: [null, null, null],
+
+  /** The drive-in pad or checkpoint kiosk you're parked on: 'spin' | 'garage' | null. */
+  pad: null,
+
+  /** Which modal panel is open: 'spin' | 'garage' | 'settings' | 'leaderboards' | 'store' | null. */
   panel: null,
-  /** Extra data for the open panel (e.g. which egg the hatch panel is for). */
   panelData: null,
 
-  /** A roll in progress: { distance, wins, prize, blocked, duration, best }. */
-  roll: null,
-  /** Wins earned by the current roll, held back from the HUD until the tire stops. */
-  pendingWins: 0,
-  /** "+N Wins!" result once the tire has stopped. */
-  rollResult: null,
-  /** A short celebration banner: { text, id } (new zone, ad reward, Gems purchase). */
-  toast: null,
-  /** Active hatch animation: { eggId, pets }. */
-  hatch: null,
-  /** Keep hatching the egg you're standing at (the T button). Client-side only. */
-  autoHatch: false,
+  /** Latest car-spin result: `{ carId, rarity, isNew, refund, id }` (id = Date.now()). */
+  spinResult: null,
+  /** True while a spin request is waiting for the authority. */
+  spinning: false,
 
+  /** Center banner: `{ text, sub?, kind: 'info'|'success'|'error'|'trick'|'checkpoint', id }`. */
+  toast: null,
+  /**
+   * Run summary shown at the finish: `{ timeMs, coins, best, unlock, id }`; `unlock` is the
+   * map id of the chapter this finish opened for the first time (else null).
+   */
+  finishResult: null,
+  /**
+   * The checkpoint just reached, for the split card: `{ index, splitMs, bestMs, id }`.
+   * `bestMs` is your best split there BEFORE this run (0 = none yet).
+   */
+  lastSplit: null,
+  /** Stage section you're driving (0 = Start..CP1); changes rarely (ticker). */
+  section: 0,
 
   // --- Actions -----------------------------------------------------------------
 
-  setProfile: (profile, session) =>
-    set((s) => ({ profile, session: session || s.session, profileLoaded: true })),
+  setProfile: (profile) => set({ profile, profileLoaded: true }),
   patchProfile: (patch) => set((s) => ({ profile: { ...s.profile, ...patch } })),
   setNet: (patch) => set((s) => ({ net: { ...s.net, ...patch } })),
-  setZone: (zone) => set({ zone }),
   setPlayable: () => set({ playable: true }),
-  setSphinxStock: (sphinxStock) => set({ sphinxStock }),
   setLeaderboards: (leaderboards) => set({ leaderboards }),
+  setStageReady: (stageReady) => set({ stageReady }),
+  setStageWarm: (stageWarm) => set(stageWarm ? { stageWarm, trackPrep: 1 } : { stageWarm }),
+  setTrackPrep: (trackPrep) => set({ trackPrep }),
+  /** Map `stageId` with its built `stage` (null while it loads); a new stage isn't warmed yet. */
+  setStage: (stageId, stage) =>
+    set((s) => (s.stage === stage ? { stageId } : { stageId, stage, stageWarm: false, ...(stageId !== s.stageId ? { trackPrep: 0 } : {}) })),
+  setTravel: (travel) => set({ travel }),
+  setItems: (items) => set({ items }),
+  setPad: (pad) => set({ pad }),
 
   openPanel: (panel, panelData = null) => set({ panel, panelData }),
   closePanel: () => set({ panel: null, panelData: null }),
   togglePanel: (panel) => set((s) => (s.panel === panel ? { panel: null, panelData: null } : { panel, panelData: null })),
 
-  /** kind: 'info' | 'error' | 'success' | 'badge' */
-
-  // A lucky gift's Wins wait for the landing too.
-  startRoll: (roll) => set({ roll, pendingWins: roll.wins + roll.prize + (roll.giftWins || 0) }),
-  endRoll: () => {
-    const { roll } = get()
-    set({
-      roll: null,
-      pendingWins: 0,
-      rollResult: roll
-        ? { wins: roll.wins, prize: roll.prize, distance: roll.distance, blocked: roll.blocked, best: roll.best, id: Date.now() }
-        : null,
-    })
-  },
-  clearRollResult: () => set({ rollResult: null }),
-  showToast: (text) => set({ toast: { text, id: Date.now() } }),
-
-  setHatch: (hatch) => set({ hatch }),
-  setAutoHatch: (autoHatch) => set({ autoHatch }),
+  setSpinResult: (spinResult) => set({ spinResult, spinning: false }),
+  setSpinning: (spinning) => set({ spinning }),
+  showToast: (text, kind = 'info', sub = undefined, detail = undefined) => set({ toast: { text, sub, detail, kind, id: Date.now() + Math.random() } }),
+  setFinishResult: (finishResult) => set({ finishResult }),
+  setLastSplit: (lastSplit) => set({ lastSplit }),
+  setSection: (section) => set({ section }),
 }))
 
 /** Non-reactive snapshot for timers and non-React code. */

@@ -110,7 +110,7 @@ export function BloxityProvider({ gameSlug, children }) {
           toUnsubscribe(
             sdk.auth.onUserChanged((nextUser) => {
               useBloxityStore.getState().setUser(nextUser || null)
-              // Friends and the Gems balance belong to the account (services.js).
+              // Friends belong to the account (services.js).
               onAccountChanged(nextUser || null)
               // The guest identity is what the HUD falls back to when signed out.
               useBloxityStore

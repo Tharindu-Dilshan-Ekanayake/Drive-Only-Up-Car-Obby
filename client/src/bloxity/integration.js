@@ -1,9 +1,10 @@
+import { bestAltitude } from '@shared/logic'
+
 import { setAdBreakMuted, setMasterVolume, setMusicVolume } from '../audio/sfx'
-import { respawn, runtime } from '../game/runtime'
+import { runtime } from '../game/runtime'
 import { getGame, useGame } from '../store/game'
 import { QUALITY_LEVELS, useQuality } from '../store/quality'
 import { handleChatMessage } from './chat'
-import { loadEmotes, playLocalEmote, stopLocalEmote } from './emotes'
 import { safeCall, toUnsubscribe } from './sdk'
 import { hideScreen, setScreen } from './services'
 import { getBloxityState, useBloxityStore } from './store'
@@ -11,7 +12,7 @@ import { getBloxityState, useBloxityStore } from './store'
 /**
  * Everything the game wires into the Boxity SDK besides auth and the avatar (those stay
  * in BloxityProvider): features, leaderboards, ad breaks, the portal's settings menu,
- * portal-sent player events (respawn, emotes), chat bubbles, gameplay lifecycle and
+ * portal-sent player events (respawn), chat, gameplay lifecycle and
  * screen ads, and - when playing offline - leaderboard scores.
  *
  * `setupOnce` runs once per page right after `init()`; `installIntegration` runs per
@@ -20,16 +21,14 @@ import { getBloxityState, useBloxityStore } from './store'
 
 /** Boards the game declares; scores come from the game server (or, offline, below). */
 export const LEADERBOARDS = [
-  { id: 'rebirths', label: 'Rebirths', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
-  { id: 'wins', label: 'Total Wins', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
-  { id: 'distance', label: 'Longest Flight (m)', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
+  { id: 'altitude', label: 'Highest Altitude (m)', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
+  { id: 'coins', label: 'Coins Collected', order: 'desc', mode: 'best', format: 'compact', reset: 'none' },
+  { id: 'finishes', label: 'Summits Reached', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
   { id: 'playtime', label: 'Minutes Played', order: 'desc', mode: 'best', format: 'number', reset: 'none' },
 ]
 
 /** Once per page, right after `Legion.SDK.init()`. */
 export function setupOnce(sdk) {
-  // Boxity draws the emote picker once a game says it can play emotes.
-  safeCall(sdk.game?.registerFeature?.bind(sdk.game), 'emotes')
   safeCall(sdk.leaderboard?.define?.bind(sdk.leaderboard), LEADERBOARDS)
 }
 
@@ -132,17 +131,11 @@ function installSettings(sdk) {
 
 // --- Player events from the portal ---------------------------------------------------
 
-function onPlayerEvent(event, data) {
+function onPlayerEvent(event) {
   switch (event) {
     case 'respawn_request':
-      // Not while your tire is rolling: you're frozen at the Roll Zone until it stops.
-      if (runtime.player.frozen) return
-      stopLocalEmote()
-      respawn()
-      runtime.camera.snap = true
-      return
-    case 'play_emote':
-      playLocalEmote(typeof data === 'string' ? data : data?.id ?? data?.emoteId)
+      // Back to your last checkpoint (the car controller does the rest).
+      runtime.input.respawn = true
       return
     default:
       // 'chat_message_sent', 'pointer_lock_changed' and anything newer: nothing to do
@@ -154,9 +147,9 @@ function onPlayerEvent(event, data) {
 function installPlayerEvents(sdk) {
   const player = sdk.player
   if (typeof player?.onEvent === 'function') {
-    return subscribe(player, 'onEvent', (event, data) => {
+    return subscribe(player, 'onEvent', (event) => {
       try {
-        onPlayerEvent(event, data)
+        onPlayerEvent(event)
       } catch (err) {
         console.warn('[bloxity] player event failed', event, err)
       }
@@ -215,9 +208,9 @@ const OFFLINE_SUBMIT_MS = 15000
 function boardScores(profile) {
   const stats = profile?.stats || {}
   return {
-    rebirths: Math.floor(Number(profile?.rebirths) || 0),
-    wins: Math.floor(Number(stats.totalWins) || 0),
-    distance: Math.floor(Number(stats.bestDistance) || 0),
+    altitude: Math.floor(bestAltitude(profile)),
+    coins: Math.floor(Number(stats.totalCoins) || 0),
+    finishes: Math.floor(Number(stats.finishes) || 0),
     playtime: Math.floor((Number(stats.playtime) || 0) / 60),
   }
 }
@@ -296,7 +289,6 @@ export function installIntegration(sdk) {
   guard('chat', () => subscribe(sdk.chat, 'onMessage', (m) => handleChatMessage(sdk, m)))
   guard('lifecycle', () => installLifecycle(sdk))
   guard('leaderboards', () => installOfflineLeaderboards(sdk))
-  loadEmotes()
 
   return () => teardown.forEach((fn) => safeCall(fn))
 }

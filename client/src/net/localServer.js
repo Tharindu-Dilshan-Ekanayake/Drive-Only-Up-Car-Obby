@@ -1,9 +1,11 @@
-import { applyOfflineProgress, normalizeProfile } from '@shared/logic'
+import { lockedMessage } from '@shared/chapters'
+import { isStageUnlocked, normalizeProfile, toSaveData } from '@shared/logic'
 import { PlayerSession } from '@shared/session'
+import { loadStage, STAGES } from '@shared/stages/index'
 
 import { runtime } from '../game/runtime'
 
-const SAVE_KEY = 'tr.save.v1'
+const SAVE_KEY = 'uwd.save.v1'
 const TICK_MS = 100
 const SAVE_MS = 5000
 
@@ -20,36 +22,79 @@ function loadSave() {
  * runs, against a save in localStorage. Used when no server is configured or it can't
  * be reached, so the game is always playable.
  *
- * @param {{ id: string, name: string, onEvent: (type: string, payload: object) => void }} options
- * @returns {{ send: (type: string, payload?: object) => void, close: () => void }}
+ * The session needs its map's stage, which loads lazily: the profile is sent at once
+ * (the HUD and garage don't need a stage), messages sent before the stage is there
+ * wait in a short queue. `switchStage(id)` moves the session to another map (travel).
+ * A map still locked for this save (a chapter: shared/logic.js isStageUnlocked) is
+ * refused as the room refuses it: a 'locked' event `{ stage, text }`, and the session
+ * stays where it was (the client goes back to Sky Docks).
+ *
+ * @param {{ id: string, name: string, stageId: string, onEvent: (type: string, payload: object) => void }} options
+ * @returns {{ send: (type: string, payload?: object) => void, switchStage: (id: string) => void, unlockAll: () => void, close: () => void }}
  */
-export function createLocalServer({ id, name, onEvent }) {
+export function createLocalServer({ id, name, stageId, onEvent }) {
   const profile = normalizeProfile(loadSave(), id, name)
-  const startedAt = Date.now()
-  // "Keep training while you're offline": credit the pad you logged off on.
-  const offline = applyOfflineProgress(profile, startedAt)
-
-  const session = new PlayerSession(profile, {
-    now: startedAt,
-    // The session mutates its profile in place; the UI must get its own copy or it
-    // would never see a change (same reference) and could edit server state.
-    emit: (type, payload) => onEvent(type, payload ? structuredClone(payload) : payload),
-    getPosition: () => runtime.player.position,
-  })
+  // The session mutates its profile in place; the UI must get its own copy or it would
+  // never see a change (same reference) and could edit server state.
+  const emit = (type, payload) => onEvent(type, payload ? structuredClone(payload) : payload)
+  let session = null
+  let closed = false
+  /** Messages that arrived before the stage was loaded. */
+  const queue = []
+  /** The map the session should be on (the last asked for). */
+  let wanted = stageId
 
   const save = () => {
     try {
       profile.lastSeen = Date.now()
-      localStorage.setItem(SAVE_KEY, JSON.stringify(profile))
+      localStorage.setItem(SAVE_KEY, JSON.stringify(toSaveData(profile)))
     } catch {
       // Storage full or blocked: progress just won't persist this session.
     }
   }
 
+  const handle = (type, payload) => {
+    // Offline there is no server to verify Boxity's word, so the host-only grant is
+    // taken here. It is only ever sent by bloxity/services.js, after Boxity reported a
+    // completed rewarded ad.
+    if (type === 'adReward') {
+      if (typeof payload?.placement === 'string') session.grantAdReward(payload.placement, Date.now())
+      save()
+      return
+    }
+    session.handle(type, payload, Date.now())
+  }
+
+  /** Puts the session on map `sid` once its stage is built (ignored if overtaken). */
+  const goTo = (sid) => {
+    if (!isStageUnlocked(profile, sid)) {
+      // Next tick: at start-up (`?map=`) the connection isn't wired up yet.
+      setTimeout(() => {
+        if (!closed) emit('locked', { stage: sid, text: lockedMessage(sid) })
+      }, 0)
+      return
+    }
+    wanted = sid
+    loadStage(sid).then((stage) => {
+      if (closed || wanted !== sid) return
+      if (!session) {
+        session = new PlayerSession(profile, { now: Date.now(), emit, getPosition: () => runtime.car.position, stage })
+        session.sendProfile()
+      } else if (session.stage !== stage) {
+        session.setStage(stage)
+      }
+      for (const [type, payload] of queue.splice(0)) handle(type, payload)
+      save()
+    })
+  }
+
+  emit('profile', { profile })
+  goTo(stageId)
+
   let last = performance.now()
   const tickId = setInterval(() => {
     const t = performance.now()
-    session.tick(Math.min(0.5, (t - last) / 1000), Date.now())
+    session?.tick(Math.min(0.5, (t - last) / 1000), Date.now())
     last = t
   }, TICK_MS)
   const saveId = setInterval(save, SAVE_MS)
@@ -59,27 +104,31 @@ export function createLocalServer({ id, name, onEvent }) {
   window.addEventListener('beforeunload', save)
   document.addEventListener('visibilitychange', onHide)
 
-  session.sendProfile()
-  if (offline) onEvent('offline', offline)
-
   return {
     send(type, payload) {
-      // Offline there is no server to verify Boxity's word, so the two host-only grants
-      // are taken here. Both are only ever sent by bloxity/services.js, after Boxity
-      // reported a completed rewarded ad / a successful Gems purchase.
-      if (type === 'adReward') {
-        if (typeof payload?.placement === 'string') session.grantAdReward(payload.placement, Date.now())
-        save()
+      if (!session || session.stage.id !== wanted) {
+        if (queue.length < 64) queue.push([type, payload])
         return
       }
-      if (type === 'gemsLocal') {
-        if (typeof payload?.sku === 'string') session.grantGemProduct(payload.sku)
-        save()
-        return
-      }
-      session.handle(type, payload, Date.now())
+      handle(type, payload)
+    },
+    switchStage(sid) {
+      // A restart for the map we're leaving may still be queued: apply it there first.
+      if (session && queue.length && session.stage.id !== sid) for (const [type, payload] of queue.splice(0)) handle(type, payload)
+      goTo(sid)
+    },
+    /**
+     * Testing only (`?debug`: `__pp.unlockAll()`, offline): opens every locked chapter in
+     * this local save. There is no online counterpart - the server only ever unlocks a
+     * chapter at a finish it recorded itself.
+     */
+    unlockAll() {
+      profile.unlocks = STAGES.filter((s) => s.unlock).map((s) => s.id)
+      emit('profile', { profile })
+      save()
     },
     close() {
+      closed = true
       clearInterval(tickId)
       clearInterval(saveId)
       window.removeEventListener('beforeunload', save)

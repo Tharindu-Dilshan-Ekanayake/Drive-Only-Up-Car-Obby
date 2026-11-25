@@ -1,15 +1,11 @@
 /**
- * Each modal panel's code, loaded on its own: none of it is needed to start playing,
+ * Each modal panel's code, loaded on its own: none of it is needed to start driving,
  * so it stays out of the start-up bundle and is fetched in the background once the
- * game is up (prefetchPanels), so opening a panel still never waits.
+ * game is up (prefetchPanels), so opening a panel never waits.
  */
 export const PANEL_LOADERS = {
-  pets: () => import('./PetsPanel'),
-  rebirth: () => import('./RebirthPanel'),
-  daily: () => import('./DailyRewardsPanel'),
-  quests: () => import('./QuestsPanel'),
-  items: () => import('./ItemsPanel'),
-  offline: () => import('./WelcomeBackPanel'),
+  garage: () => import('./GaragePanel'),
+  spin: () => import('./SpinPanel'),
   store: () => import('./StorePanel'),
   leaderboards: () => import('./LeaderboardsPanel'),
   settings: () => import('./SettingsPanel'),

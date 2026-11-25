@@ -1,206 +1,341 @@
-import { useState } from 'react'
+import { useState } from "react";
 
-import { AD_REWARDS, GEM_PRODUCTS, PETS, SHOP } from '@shared/balance'
-import { formatNumber } from '@shared/format'
+import { AD_REWARDS, MAX_SLOTS, PRODUCTS } from "@shared/balance";
 
-import { buyGems, isRewardedAvailable, useGemsBalance, watchRewardedAd } from '../../bloxity/services'
-import { buy } from '../../net/shop'
-import { useGame } from '../../store/game'
-import Icon from '../Icon'
-import PetIcon from '../PetIcon'
-import RewardIcon from '../RewardIcon'
-import StrokeText from '../StrokeText'
-import { ChunkyButton, Price } from '../hud/parts'
-import { GRADIENTS, u } from '../hud/style'
-import Panel from './Panel'
+import { sfx } from "../../audio/sfx";
+import { isRewardedAvailable, watchRewardedAd } from "../../bloxity/services";
+import { actions } from "../../net/actions";
+import { useGame } from "../../store/game";
+import Icon from "../Icon";
+import StrokeText from "../StrokeText";
+import { buyNextSlot, nextSlotCost } from "../hud/slots";
+import { ChunkyButton, CoinAmount, SectionLabel } from "../hud/parts";
+import { GRADIENTS, u } from "../hud/style";
+import { NitroShop, PaintShop } from "./CosmeticsShop";
+import Panel, { Well } from "./Panel";
 
-const SECTIONS = [
-  { title: 'Passes', items: ['healthX2', 'winsX2', 'autoRoll'] },
-  { title: 'Training Pads', items: ['padVeryOp', 'padBest'] },
-  { title: 'Specials', items: ['sphinx'] },
-]
+const TABS = [
+  { id: "offers", label: "OFFERS", icon: "store" },
+  { id: "paint", label: "PAINT", icon: "car" },
+  { id: "nitro", label: "NITRO", icon: "nitro" },
+];
 
-const ICONS = {
-  healthX2: 'heart',
-  winsX2: 'trophy',
-  autoRoll: 'tire',
-  padVeryOp: 'portal',
-  padBest: 'portal',
-}
+/** Rewarded-ad placement that grants a free spin (shared/balance.js AD_REWARDS). */
+const FREE_SPIN_PLACEMENT =
+  Object.keys(AD_REWARDS || {}).find((k) => AD_REWARDS[k]?.grant?.spin) ||
+  "free-spin";
 
-const BLURBS = {
-  healthX2: 'Double every Power gain, forever',
-  winsX2: 'Double the Wins from every launch, forever',
-  autoRoll: 'Stretches and launches you from the Launch Pad',
-  padVeryOp: 'Unlocks the x40 Diamond Pad',
-  padBest: 'Unlocks the x100 Galaxy Pad',
-  sphinx: `Limited: x${formatNumber(PETS.sphinx.mult)} Power pet`,
-}
+const productList = () =>
+  Array.isArray(PRODUCTS)
+    ? PRODUCTS
+    : Object.entries(PRODUCTS || {}).map(([id, p]) => ({ id, ...p }));
 
-const BLURB_STYLE = { color: '#3a2a10', fontFamily: 'system-ui, sans-serif', fontWeight: 700 }
-
-/** A shop card: icon, name, what it does, and its button. */
-function Card({ icon, name, blurb, faded, children }) {
+/** A price in Sky Pearls: the pearl icon and the count (red when you can't pay). */
+function PearlAmount({ amount, size = 28, afford = true }) {
   return (
-    <div
-      className="flex flex-col items-center text-center"
-      style={{ padding: u(10), borderRadius: u(8), border: `${u(5)} solid #111`, background: faded ? GRADIENTS.greyButton : GRADIENTS.rewardCard }}
+    <span
+      className="inline-flex items-center"
+      style={{ gap: u(size * 0.15), fontSize: u(size), lineHeight: 1 }}
     >
-      {icon}
-      <span style={{ fontSize: u(name.length > 12 ? 24 : 30), lineHeight: 1.1 }}>
-        <StrokeText stroke={u(6)} style={{ whiteSpace: 'normal' }}>
-          {name}
-        </StrokeText>
-      </span>
-      <span className="whitespace-normal" style={{ fontSize: u(18), minHeight: u(44), margin: `${u(4)} 0` }}>
-        <span style={BLURB_STYLE}>{blurb}</span>
-      </span>
-      {children}
-    </div>
-  )
-}
-
-function SectionTitle({ children }) {
-  return (
-    <div style={{ fontSize: u(40), marginBottom: u(8) }}>
-      <StrokeText stroke={u(8)} gradient={GRADIENTS.gold}>
-        {children}
+      <Icon name="pearl" size={u(size * 1.25)} />
+      <StrokeText
+        stroke={u(size * 0.24)}
+        gradient={afford ? GRADIENTS.pearl : GRADIENTS.red}
+      >
+        {amount}
       </StrokeText>
-    </div>
-  )
+    </span>
+  );
 }
 
-const GRID = { gridTemplateColumns: `repeat(auto-fill, minmax(${u(200)}, 1fr))`, gap: u(12) }
+function ProductCard({ product, coins, pearls, slots }) {
+  const withPearls = product.kind === "pearls";
+  const price = Number(product.price ?? product.cost ?? 0);
+  // The item slot has nothing to sell once every slot is open.
+  const soldOut = product.id === "slot_pass" && slots >= MAX_SLOTS;
+  const afford = !soldOut && (withPearls ? pearls >= price : coins >= price);
+  const onBuy = () => {
+    if (!afford) {
+      sfx.error();
+      useGame
+        .getState()
+        .showToast(
+          withPearls ? "Not enough pearls" : "Not enough coins",
+          "error",
+          `${product.name} costs ${product.priceLabel || price}`,
+        );
+      return;
+    }
+    // Pearl purchases play their sound and fanfare when the server confirms them.
+    if (!withPearls) sfx.buy();
+    actions.purchase(product.id);
+    // A spin product: watch it land on the Car Spin's reel.
+    if (product.id.includes("spin")) {
+      useGame.getState().setSpinning(true);
+      useGame.getState().openPanel("spin");
+    }
+  };
+  return (
+    <Well
+      className="pp-product flex flex-col items-center text-center"
+      style={{ gap: u(8), paddingTop: u(20) }}
+    >
+      <span
+        className="pp-halo flex items-center justify-center"
+        style={{ width: u(112), height: u(112) }}
+      >
+        <Icon
+          name={
+            product.icon ||
+            (product.coins
+              ? "coin"
+              : product.id.includes("spin")
+                ? "spin"
+                : product.id.includes("slot")
+                  ? "lock"
+                  : "store")
+          }
+          size={u(84)}
+        />
+      </span>
+      <span style={{ fontSize: u(30) }}>
+        <StrokeText stroke={u(7)}>{product.name || product.id}</StrokeText>
+      </span>
+      {product.coins > 0 && <CoinAmount amount={product.coins} size={28} />}
+      {(product.blurb || product.description) && (
+        <span
+          className="pp-stroke"
+          style={{
+            fontSize: u(18),
+            whiteSpace: "normal",
+            lineHeight: 1.3,
+            display: "block",
+            opacity: 0.85,
+          }}
+        >
+          {product.blurb || product.description}
+        </span>
+      )}
+      <ChunkyButton
+        onClick={onBuy}
+        disabled={soldOut}
+        gradient={afford ? GRADIENTS.greenButton : GRADIENTS.greyButton}
+        radius={16}
+        style={{
+          height: u(70),
+          padding: `0 ${u(22)}`,
+          marginTop: "auto",
+          minWidth: u(170),
+        }}
+      >
+        {soldOut ? (
+          <span style={{ fontSize: u(26) }}>
+            <StrokeText stroke={u(6)}>ALL OPEN</StrokeText>
+          </span>
+        ) : withPearls ? (
+          <PearlAmount amount={price} afford={afford} />
+        ) : (
+          <CoinAmount amount={price} size={28} afford={afford} />
+        )}
+      </ChunkyButton>
+    </Well>
+  );
+}
 
 /**
- * Boxity Gems: real-currency extras, priced by Boxity's catalog (the game only names
- * the sku). The purchase is confirmed to the game server by Boxity, which then grants
- * it; offline it's granted here once Boxity says it went through.
+ * Store, in three tabs: OFFERS (item-slot upgrades, products from shared/balance.js
+ * PRODUCTS - the Mega Spin for coins, coin packs and an item slot for Sky Pearls - and a
+ * free spin for watching an ad where Boxity offers one), PAINT and NITRO (colours for
+ * coins, CosmeticsShop.jsx).
  */
-function GemsSection() {
-  const balance = useGemsBalance()
-  const [busy, setBusy] = useState(null)
-  const [message, setMessage] = useState(null)
-  const purchase = async (sku) => {
-    setBusy(sku)
-    setMessage(null)
-    const result = await buyGems(sku)
-    setBusy(null)
-    if (!result.success) setMessage(result.error ? `Purchase not completed: ${result.error}` : 'Purchase not completed')
-  }
+export function StorePanel() {
+  const coins = useGame((s) => s.profile.coins || 0);
+  const slots = useGame((s) => s.profile.slots || 1);
+  const pearls = useGame((s) => s.profile.pearlBank || 0);
+  const slotCost = nextSlotCost(slots);
+  const products = productList();
+  const adAvailable = isRewardedAvailable();
+  const [tab, setTab] = useState("offers");
+
   return (
-    <div>
-      <div className="flex flex-wrap items-baseline justify-between" style={{ gap: u(10) }}>
-        <SectionTitle>Gems Shop</SectionTitle>
-        {balance !== null && (
-          <span style={{ fontSize: u(30) }}>
-            <StrokeText stroke={u(6)} fill="#7fe2ff">
-              {formatNumber(balance)} Gems
-            </StrokeText>
-          </span>
-        )}
-      </div>
-      <div className="grid" style={GRID}>
-        {Object.entries(GEM_PRODUCTS).map(([sku, product]) => (
-          <Card key={sku} icon={<RewardIcon icon={product.icon} size={u(96)} />} name={product.name} blurb={product.blurb}>
-            <ChunkyButton gradient={GRADIENTS.blueButton} disabled={busy !== null} onClick={() => purchase(sku)} className="w-full" style={{ height: u(58) }}>
-              <span style={{ fontSize: u(30) }}>
-                <StrokeText stroke={u(6)}>{busy === sku ? '...' : 'Buy with Gems'}</StrokeText>
+    <Panel title="STORE" icon="store" width={1160}>
+      <div className="flex flex-col" style={{ gap: u(18) }}>
+        <span
+          className="pp-tabs flex self-start"
+          style={{ gap: u(6), padding: u(6), borderRadius: u(20) }}
+        >
+          {TABS.map((t) => (
+            <ChunkyButton
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              gradient={
+                t.id === tab ? GRADIENTS.goldButton : GRADIENTS.navyButton
+              }
+              radius={14}
+              className={t.id === tab ? "pp-tab-on" : ""}
+              style={{ height: u(60), padding: `0 ${u(18)}`, gap: u(8) }}
+            >
+              <Icon name={t.icon} size={u(36)} />
+              <span style={{ fontSize: u(24) }}>
+                <StrokeText stroke={u(6)}>{t.label}</StrokeText>
               </span>
             </ChunkyButton>
-          </Card>
-        ))}
-      </div>
-      {message && (
-        <p className="m-0 text-center" style={{ fontSize: u(24), marginTop: u(8) }}>
-          <StrokeText stroke={u(5)} fill="#ffd27a">
-            {message}
-          </StrokeText>
-        </p>
-      )}
-    </div>
-  )
-}
-
-/** Free potions for watching an ad (Boxity rewarded ads), when Boxity has one to show. */
-function FreeSection() {
-  const [state, setState] = useState({})
-  if (!isRewardedAvailable()) return null
-  const watch = async (placement) => {
-    setState((s) => ({ ...s, [placement]: 'watching' }))
-    const result = await watchRewardedAd(placement)
-    setState((s) => ({ ...s, [placement]: result.ok ? 'done' : 'retry' }))
-  }
-  return (
-    <div>
-      <SectionTitle>Free Rewards</SectionTitle>
-      <div className="grid" style={GRID}>
-        {Object.entries(AD_REWARDS).map(([placement, reward]) => {
-          const status = state[placement]
-          return (
-            <Card key={placement} icon={<Icon name={reward.icon} size={u(96)} />} name={reward.label} blurb="Watch a short ad to get it">
-              <ChunkyButton
-                gradient={GRADIENTS.greenButton}
-                disabled={status === 'watching'}
-                onClick={() => watch(placement)}
-                className="w-full"
-                style={{ height: u(58) }}
-              >
-                <span style={{ fontSize: u(28) }}>
-                  <StrokeText stroke={u(6)}>{status === 'watching' ? '...' : status === 'retry' ? 'Try again later' : status === 'done' ? 'Got it!' : 'Watch Ad'}</StrokeText>
+          ))}
+        </span>
+        {tab === "paint" && (
+          <>
+            <SectionLabel style={{ marginBottom: 0 }}>
+              PAINT · ANY CAR YOU DRIVE
+            </SectionLabel>
+            <PaintShop />
+          </>
+        )}
+        {tab === "nitro" && (
+          <>
+            <SectionLabel style={{ marginBottom: 0 }}>
+              NITRO FLAME COLOUR
+            </SectionLabel>
+            <NitroShop />
+          </>
+        )}
+        {tab === "offers" && (
+          <>
+            <Well
+              className="pp-feature flex flex-wrap items-center justify-between"
+              style={{ gap: u(14) }}
+            >
+              <span className="flex items-center" style={{ gap: u(12) }}>
+                <span
+                  className="pp-halo flex shrink-0 items-center justify-center"
+                  style={{ width: u(92), height: u(92) }}
+                >
+                  <Icon
+                    name={slotCost == null ? "check" : "lock"}
+                    size={u(66)}
+                  />
                 </span>
-              </ChunkyButton>
-            </Card>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
+                <span className="flex flex-col">
+                  <span style={{ fontSize: u(32) }}>
+                    <StrokeText stroke={u(7)}>
+                      {slotCost == null
+                        ? "All item slots unlocked"
+                        : `Item slot ${slots + 1}`}
+                    </StrokeText>
+                  </span>
+                  <span
+                    className="pp-stroke"
+                    style={{
+                      fontSize: u(18),
+                      opacity: 0.85,
+                      whiteSpace: "normal",
+                      lineHeight: 1.3,
+                      display: "block",
+                    }}
+                  >
+                    Carry one more item from the item crates on the track.
+                  </span>
+                </span>
+              </span>
+              {slotCost != null && (
+                <ChunkyButton
+                  onClick={buyNextSlot}
+                  ready={coins >= slotCost}
+                  gradient={
+                    coins >= slotCost
+                      ? GRADIENTS.goldButton
+                      : GRADIENTS.greyButton
+                  }
+                  radius={16}
+                  style={{ height: u(74), padding: `0 ${u(26)}`, gap: u(10) }}
+                >
+                  <span style={{ fontSize: u(28) }}>
+                    <StrokeText stroke={u(6)}>UNLOCK</StrokeText>
+                  </span>
+                  <CoinAmount
+                    amount={slotCost}
+                    size={28}
+                    afford={coins >= slotCost}
+                  />
+                </ChunkyButton>
+              )}
+            </Well>
 
-/** Everything Wins can buy besides balls, eggs and Health packs, grouped, plus Gems and free rewards. */
-export function StorePanel() {
-  const passes = useGame((s) => s.profile.passes)
-  const wins = useGame((s) => s.profile.wins)
-  return (
-    <Panel title="STORE" width={1080}>
-      <div className="flex flex-col" style={{ gap: u(18) }}>
-        <FreeSection />
-        {SECTIONS.map((section) => (
-          <div key={section.title}>
-            <SectionTitle>{section.title}</SectionTitle>
-            <div className="grid" style={GRID}>
-              {section.items.map((id) => {
-                const product = SHOP[id]
-                const owned = product.kind === 'pass' && passes[id]
-                const icon = id === 'sphinx' ? <PetIcon id="sphinx" size={u(96)} /> : <Icon name={ICONS[id]} size={u(96)} />
-                return (
-                  <Card key={id} icon={icon} name={product.name} blurb={BLURBS[id]} faded={owned}>
-                    <ChunkyButton
-                      gradient={owned ? GRADIENTS.greyButton : GRADIENTS.greenButton}
-                      disabled={owned}
-                      onClick={() => buy(id)}
-                      className="w-full"
-                      style={{ height: u(58) }}
-                    >
-                      {owned ? (
-                        <span style={{ fontSize: u(30) }}>
-                          <StrokeText stroke={u(6)}>Owned</StrokeText>
-                        </span>
-                      ) : (
-                        <Price amount={product.price} size={32} afford={wins >= product.price} />
-                      )}
-                    </ChunkyButton>
-                  </Card>
-                )
-              })}
-            </div>
-          </div>
-        ))}
-        <GemsSection />
+            {adAvailable && (
+              <Well
+                className="pp-feature flex flex-wrap items-center justify-between"
+                style={{ gap: u(14) }}
+              >
+                <span className="flex items-center" style={{ gap: u(12) }}>
+                  <span
+                    className="pp-halo flex shrink-0 items-center justify-center"
+                    style={{ width: u(92), height: u(92) }}
+                  >
+                    <Icon name="spin" size={u(66)} />
+                  </span>
+                  <span style={{ fontSize: u(30) }}>
+                    <StrokeText stroke={u(7)}>Free car spin</StrokeText>
+                  </span>
+                </span>
+                <ChunkyButton
+                  onClick={async () => {
+                    const res = await watchRewardedAd(FREE_SPIN_PLACEMENT);
+                    if (!res.ok) return;
+                    useGame.getState().setSpinning(true);
+                    useGame.getState().openPanel("spin");
+                  }}
+                  gradient={GRADIENTS.tealButton}
+                  radius={16}
+                  style={{ height: u(74), padding: `0 ${u(26)}` }}
+                >
+                  <span style={{ fontSize: u(26) }}>
+                    <StrokeText stroke={u(6)}>WATCH AD</StrokeText>
+                  </span>
+                </ChunkyButton>
+              </Well>
+            )}
+
+            {products.length > 0 && (
+              <div
+                className="flex flex-wrap items-center justify-between"
+                style={{ gap: u(10) }}
+              >
+                <SectionLabel style={{ marginBottom: 0 }}>
+                  SPECIAL OFFERS
+                </SectionLabel>
+                <span
+                  className="pp-pearl-bank flex items-center"
+                  style={{ gap: u(10), fontSize: u(26), lineHeight: 1 }}
+                  title="Sky Pearls you have found and not spent yet"
+                >
+                  <StrokeText stroke={u(6)}>Your pearls:</StrokeText>
+                  <PearlAmount amount={pearls} size={28} />
+                </span>
+              </div>
+            )}
+            {products.length > 0 && (
+              <div
+                className="grid"
+                style={{
+                  gridTemplateColumns: `repeat(auto-fill, minmax(${u(250)}, 1fr))`,
+                  gap: u(14),
+                }}
+              >
+                {products.map((p) => (
+                  <ProductCard
+                    key={p.id}
+                    product={p}
+                    coins={coins}
+                    pearls={pearls}
+                    slots={slots}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
       </div>
     </Panel>
-  )
+  );
 }
 
-export default StorePanel
+export default StorePanel;

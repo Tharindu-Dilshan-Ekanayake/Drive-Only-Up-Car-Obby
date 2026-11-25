@@ -9,12 +9,19 @@ import BloxityProvider from './bloxity/BloxityProvider.jsx'
 import FpsMeter from './bloxity/FpsMeter.jsx'
 import { GAME_SLUG } from './bloxity/identity'
 import { installDebugHooks } from './debug'
+import { installStageLoader } from './game/prep/prepClient'
+import './ui/hostAds'
+import { prerasterIcons } from './ui/icons'
 import './index.css'
 
 // Start-up milestones (pp:*) show up in DevTools' Performance panel and are read by
 // the automated load test.
 performance.mark('pp:main')
 installDebugHooks()
+// Maps' stage data and heavy geometry are built in a worker (game/prep), never in a frame.
+installStageLoader()
+// HUD icons as bitmaps (rasterised on the CPU), before the HUD first appears.
+prerasterIcons()
 installAudioUnlock()
 // Every chunky button clicks.
 window.addEventListener('pointerdown', (e) => {

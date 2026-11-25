@@ -1,0 +1,193 @@
+/*
+ * The HUD drawn flat (imported by HUD.jsx; text and buttons go flat through FlatFill,
+ * ../flatFill.js). Same colours, shapes and layout as index.css, but only a handful of
+ * kinds of paint: solid fills, hard offset / spread shadows (no blur), the hazard stripes
+ * (one repeating gradient, the HUD's signature) - no smooth gradients, blurred shadows,
+ * filters or idle animations. Every distinct kind is a GPU shader the browser compiles
+ * the first time it paints the HUD: that was ~3 s of GPU time on a cold browser, a freeze
+ * right after the loading screen. Event pop-ups (toasts, banners, split card, speed lines)
+ * keep their effects; ui/RasterWarmup.jsx paints them under the loading screen.
+ */
+
+/* ---- Idle animations: none (the full-nitro pulse, the menu buttons' shine sweep). */
+.hud-root .hud-nitro[data-nitro='full'] .hud-nitro-fill,
+.hud-root .hud-gauge[data-nitro='full'] .hud-nitro-arc,
+.hud-root .hud-gauge[data-nitro='full'] .hud-nitro-icon {
+  animation: none;
+  filter: none;
+}
+.hud-root .hud-mb-face::after {
+  display: none;
+}
+
+/* ---- Filters: none (the icons have their own ink outlines). */
+.hud-root .hud-coins-icon,
+.hud-root .hud-pearls-icon,
+.hud-root .hud-mb-icon,
+.hud-root .hud-rail-flag,
+.hud-root .hud-slot-icon,
+.hud-root .hud-toast-icon,
+.hud-root .hud-wallet img {
+  filter: none;
+}
+.hud-root .hud-wallet .pp-text-stroke {
+  text-shadow: 0 0.06em 0 #0d1530;
+}
+
+/* ---- Hazard stripes without the gloss layer over them. */
+.hud-root .hud-cp-trim,
+.hud-root .hud-slot-trim {
+  background: repeating-linear-gradient(-45deg, #ffc41f 0 calc(var(--px) * 14), #24282e calc(var(--px) * 14) calc(var(--px) * 28)) !important;
+}
+.hud-root .hud-menu::before {
+  background: repeating-linear-gradient(-45deg, #ffc41f 0 calc(var(--px) * 10), #0d1530 calc(var(--px) * 10) calc(var(--px) * 20));
+}
+.hud-root .hud-rail-cap {
+  background: repeating-linear-gradient(-45deg, #ffc41f 0 calc(var(--px) * 6), #0d1530 calc(var(--px) * 6) calc(var(--px) * 12));
+}
+
+/* ---- Navy plates: the timer plate, name tag, menu dock. */
+.hud-root .hud-cp {
+  background: rgba(25, 43, 96, 0.92);
+  box-shadow:
+    0 calc(var(--px) * 5) 0 #0d1530,
+    inset 0 0 0 calc(var(--px) * 2) rgba(95, 227, 255, 0.16),
+    inset 0 calc(var(--px) * 3) 0 rgba(255, 255, 255, 0.1);
+}
+.hud-root .hud-tag {
+  background: rgba(25, 43, 96, 0.95);
+  box-shadow:
+    0 calc(var(--px) * 6) 0 #0d1530,
+    inset 0 0 0 calc(var(--px) * 2) rgba(95, 227, 255, 0.16),
+    inset 0 calc(var(--px) * 3) 0 rgba(255, 255, 255, 0.1);
+}
+.hud-root .hud-menu {
+  background: rgba(25, 43, 96, 0.95);
+  box-shadow:
+    0 calc(var(--px) * 6) 0 #0d1530,
+    inset 0 0 0 calc(var(--px) * 2) rgba(95, 227, 255, 0.14),
+    inset 0 calc(var(--px) * 3) 0 rgba(255, 255, 255, 0.12);
+}
+
+/* ---- Chips and keys. */
+.hud-root .hud-cp-tag,
+.hud-root .hud-rail-chip {
+  background: #ffcb1f;
+}
+.hud-root .hud-cp-fill {
+  background: #7cf25a;
+}
+.hud-root .hud-cp-best {
+  box-shadow: inset 0 calc(var(--px) * 2) 0 rgba(0, 0, 0, 0.3);
+}
+.hud-root .pp-keycap {
+  background: #e4eaf2;
+}
+.hud-root .hud-tag-avatar {
+  background: #5d76a6;
+}
+.hud-root .hud-tag-best {
+  background: rgba(9, 16, 41, 0.55);
+  box-shadow: inset 0 calc(var(--px) * 3) 0 rgba(0, 0, 0, 0.3);
+}
+
+/*
+ * ---- Menu buttons: the face in its colour, the shine a flat highlight - and, once
+ * menuArt.js has painted them (data-art), the finished bitmap faces and name plate: a glossy
+ * gradient, sunburst, glow well, bevel and rivets as plain images (no gradient shaders).
+ */
+.hud-root .hud-mb[data-art='1'] .hud-mb-face {
+  background: var(--mb-art) center / 100% 100% no-repeat, var(--mb-flat);
+}
+.hud-root .hud-mb[data-art='1'] .hud-mb-shine {
+  display: none;
+}
+.hud-root .hud-menu[data-art='1'] .hud-mb-plate {
+  background: var(--mb-plate-art) center / 100% 100% no-repeat, #172a5e;
+}
+/* Hover: lift only (a brightness filter would be one more shader to compile on first hover). */
+.hud-root .hud-mb.pp-btn:hover:not(:disabled) {
+  filter: none;
+}
+.hud-root .hud-mb {
+  box-shadow: 0 calc(var(--px) * 6) 0 #0d1530;
+}
+.hud-root .hud-mb-face {
+  background: var(--mb-flat);
+}
+.hud-root .hud-mb-shine {
+  background: rgba(255, 255, 255, 0.3);
+}
+.hud-root .hud-mb-plate {
+  background: #172a5e;
+}
+
+/* ---- Speed gauge, nitro bar, item slots. */
+.hud-root .hud-gauge {
+  box-shadow: 0 calc(var(--px) * 6) 0 #0d1530;
+}
+.hud-root .hud-gauge-ring {
+  box-shadow: 0 0 0 calc(var(--px) * 5) #5fe3ff;
+}
+.hud-root .hud-nitro-badge {
+  background: #1f3c7a;
+}
+.hud-root .hud-nitro .hud-nitro-track {
+  background: rgba(13, 24, 58, 0.85);
+  box-shadow: 0 calc(var(--px) * 5) 0 #0d1530;
+}
+.hud-root .hud-nitro[data-nitro='boost'] .hud-nitro-track {
+  box-shadow:
+    0 calc(var(--px) * 5) 0 #0d1530,
+    0 0 0 calc(var(--px) * 3) #5fe3ff;
+}
+.hud-root .hud-nitro-fill {
+  background: #5fe3ff;
+}
+.hud-root .hud-nitro[data-nitro='full'] .hud-nitro-fill {
+  background: #8cefff;
+}
+.hud-root .hud-slot {
+  box-shadow:
+    0 calc(var(--px) * 5) 0 #0d1530,
+    inset 0 calc(var(--px) * 3) 0 rgba(255, 255, 255, 0.3),
+    inset 0 calc(var(--px) * -4) 0 rgba(0, 0, 0, 0.25);
+}
+
+/* ---- Altitude rail. */
+.hud-root .hud-rail-tube {
+  background: #1d3270;
+  box-shadow: 0 0 0 calc(var(--px) * 2) rgba(95, 227, 255, 0.28);
+}
+.hud-root .hud-rail-fill {
+  background: #7ef0d8;
+}
+.hud-root .hud-rail-start {
+  background: #3fd97a;
+}
+.hud-root .hud-rail-disc {
+  background: #9fe9ff;
+  box-shadow:
+    0 0 0 calc(var(--px) * 3) #ffffff,
+    0 0 0 calc(var(--px) * 6) #0d1530;
+}
+.hud-root .hud-rail-pip[data-reached='1'] {
+  background: #ffd52a;
+  box-shadow: 0 calc(var(--px) * 2) 0 #0d1530;
+}
+
+/* ---- Toast band (a pop-up, but on screen often). */
+.hud-root .hud-toast-band {
+  background: rgba(22, 38, 83, 0.88);
+}
+
+/* ---- Section banner (on screen at every new section). */
+.hud-root .hud-banner-tail {
+  background: #152a5c;
+}
+.hud-root .hud-banner-shine {
+  display: none;
+}
+.hud-root .hud-split-delta {
+  box-shadow: none;
+}

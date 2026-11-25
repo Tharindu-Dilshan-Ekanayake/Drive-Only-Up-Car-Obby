@@ -1,9 +1,9 @@
-# Ships +1 Arm Length to Bloxity Legion: the dev branch to the dev channel, main to prod.
+# Ships Drive Only Up Car Obby (Up We Drive) to Bloxity Legion: the dev branch to the dev channel, main to prod.
 #
 #   server   -> Docker image in this repo's GitHub Container Registry, then Legion rolls
-#               it out (https://1-arm-length.host.bloxity.io / .dev.host.bloxity.io)
-#   frontend -> the built client, served at https://1-arm-length.play.bloxity.io
-#               (prod) and https://1-arm-length.dev.play.bloxity.io (dev)
+#               it out (https://drive-only-up-car-obby.host.bloxity.io / .dev.host.bloxity.io)
+#   frontend -> the built client, served at https://drive-only-up-car-obby.play.bloxity.io
+#               (prod) and https://drive-only-up-car-obby.dev.play.bloxity.io (dev)
 #
 # Every push deploys to the production platform, and to the staging platform too once
 # its token exists. A manual run (Actions -> Run workflow) deploys any branch to the one
@@ -13,7 +13,7 @@
 #   LEGION_DEPLOY_TOKEN        production platform (required)
 #   LEGION_DEPLOY_TOKEN_STAGE  staging platform (optional; staging is skipped without it)
 # After the first run, make the ghcr.io package public so Legion can pull it
-# (repo -> Packages -> 1-arm-length-server -> Package settings -> Change visibility).
+# (repo -> Packages -> drive-only-up-car-obby-server -> Package settings -> Change visibility).
 #
 # One client build works on every platform: the Bloxity SDK and the server find their
 # own environment at runtime, so no URL or environment goes into the build.
@@ -32,10 +32,12 @@ on:
         default: staging
 
 env:
-  GAME_ID: 1-arm-length
-  # Seats per pod: the Colyseus room's maxClients (GameRoom.js MAX_CLIENTS). When a pod
-  # fills to it, Legion's matchmaker starts another.
-  SEAT_CAP: 8
+  GAME_ID: drive-only-up-car-obby
+  # Seats per pod: the Colyseus room's maxClients (GameRoom.js MAX_CLIENTS = 50, shared/poseCodec.js
+  # ROOM_CAPACITY). When a pod fills to it, Legion's matchmaker starts another. Measured on one
+  # pod's worth of work: 34 simulated players across two maps used ~95 MB of the pod's 512 MB and
+  # a few percent of its vCPU, so 50 is comfortable.
+  SEAT_CAP: 50
 
 concurrency:
   group: deploy-${{ github.ref_name }}

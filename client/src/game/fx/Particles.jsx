@@ -1,117 +1,126 @@
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useMemo, useRef } from 'react'
-import { Color, Euler, Matrix4, Quaternion, Vector3 } from 'three'
+import { useEffect } from 'react'
+import { BoxGeometry, Color, InstancedMesh, Matrix4, MeshBasicMaterial, Quaternion, Vector3 } from 'three'
 
 import { useQuality } from '../../store/quality'
-import { createBoxInstances, disposeBlocks } from '../blocks'
-import { sharedMaterials, STYLE } from '../materials'
+import { PALETTE } from '../palette'
+import { runtime } from '../runtime'
 import { drainBursts } from './fxQueue'
 
-/** Fixed pool: bursts reuse the oldest pieces when it's full. */
-const POOL = 160
-const GRAVITY = 14
+/**
+ * One fixed pool of little cubes for every burst (confetti, coin sparkle, splashes,
+ * drift smoke): one draw call, no allocation after start-up. Off on presets without
+ * particles (bursts are just drained).
+ */
+
+const POOL = 220
+const PALETTES = {
+  confetti: [PALETTE.uiYellow, PALETTE.uiTeal, PALETTE.uiOrange, PALETTE.uiGreen, '#ff3d7f', '#ffffff'],
+  gold: [PALETTE.coin, '#fff3a8', PALETTE.coinEdge],
+  item: [PALETTE.item, '#ffffff', PALETTE.uiTeal],
+  splash: ['#eafcff', '#bdefff', '#7fd8ec'],
+  smoke: ['#e8ecf0', '#d4dae0', '#c2c9d0'],
+  spark: ['#fff1a8', '#ffc41f', '#ff7a1a'],
+  // Missile flames and the embers / soot of a burning car (game/fx/missiles.js).
+  flame: ['#fff1a8', '#ffb020', '#ff5a1a', '#ff3b1a'],
+  soot: ['#4a4f57', '#2b2f36', '#6b7280'],
+}
+const GRAVITY = { confetti: 9, gold: 6, item: 4, splash: 18, smoke: -1.5, spark: 14, flame: -6, soot: -3 }
 
 const _m = new Matrix4()
 const _q = new Quaternion()
-const _e = new Euler()
 const _s = new Vector3()
-/** Size of one confetti piece. */
-const PIECE = new Vector3(0.22, 0.22, 0.06)
+const _c = new Color()
+const _axis = new Vector3(1, 1, 0).normalize()
 
-/** Pool state. Module-level: there is one particle system, mutated every frame. */
-const pieces = Array.from({ length: POOL }, () => ({
-  life: 0,
-  pos: new Vector3(),
-  vel: new Vector3(),
-  rot: new Vector3(),
-  spin: new Vector3(),
-}))
+/** The one particle system (module-level: a single pool, mutated every frame). */
+let system = null
 
-const PALETTES = {
-  confetti: ['#ff3b5c', '#ffd21f', '#4ef05a', '#2fc6ff', '#b15cff', '#ffffff'].map((c) => new Color(c)),
-  gold: ['#ffe45c', '#ffc21f', '#ff9a12', '#ffffff'].map((c) => new Color(c)),
-  power: ['#ffd84a', '#ffa21c', '#ffffff'].map((c) => new Color(c)),
-  /** Splinters and sawdust from a smashed wooden wall. */
-  wood: ['#c98f52', '#a8743f', '#e8c48a', '#8a5a32', '#fff3d6'].map((c) => new Color(c)),
-}
+function createSystem() {
+  const geometry = new BoxGeometry(1, 1, 1)
+  const material = new MeshBasicMaterial({ color: '#ffffff' })
+  const mesh = new InstancedMesh(geometry, material, POOL)
+  mesh.count = 0
+  mesh.frustumCulled = false
+  mesh.setColorAt(0, _c.set('#ffffff'))
+  const pieces = Array.from({ length: POOL }, () => ({
+    life: 0,
+    max: 1,
+    pos: new Vector3(),
+    vel: new Vector3(),
+    size: 0.2,
+    spin: 0,
+    gravity: 9,
+    grow: 0,
+    color: new Color(),
+  }))
+  let next = 0
 
-/**
- * Confetti bursts (level up, rebirth, landing, purchases). One InstancedMesh, a fixed
- * pool of pieces, no allocation after start-up. Off entirely on presets without
- * particles: bursts queued there are simply dropped.
- */
-export function Particles() {
-  const enabled = useQuality((s) => s.settings.particles)
-  const ref = useRef(null)
-  const next = useRef(0)
+  function spawn(x, y, z, palette, speed, smoke) {
+    const p = pieces[next]
+    next = (next + 1) % POOL
+    const colors = PALETTES[palette] || PALETTES.confetti
+    p.color.set(colors[Math.floor(Math.random() * colors.length)])
+    p.pos.set(x + (Math.random() - 0.5) * 0.6, y, z + (Math.random() - 0.5) * 0.6)
+    const a = Math.random() * Math.PI * 2
+    const up = palette === 'splash' ? 0.9 + Math.random() : 0.3 + Math.random() * 0.9
+    p.vel.set(Math.cos(a) * speed * (0.3 + Math.random() * 0.7), up * speed, Math.sin(a) * speed * (0.3 + Math.random() * 0.7))
+    p.gravity = GRAVITY[palette] ?? 9
+    p.max = smoke ? 0.9 : 0.8 + Math.random() * 0.7
+    p.life = p.max
+    p.size = smoke ? 0.55 : palette === 'splash' ? 0.32 : 0.2
+    p.grow = smoke ? 2 : 0
+    p.spin = Math.random() * 4
+  }
 
-  const mesh = useMemo(() => {
-    // Glowing toy boxes through the shared toy material: no extra shader program.
-    // Every piece starts parked at zero scale.
-    const m = createBoxInstances(POOL, sharedMaterials().toy, STYLE.GLOW)
-    m.count = POOL
-    m.visible = false
-    return m
-  }, [])
-
-  useEffect(
-    () => () => {
-      // A remounted system (context restore) starts with an empty pool.
-      for (const p of pieces) p.life = 0
-      disposeBlocks(mesh)
-    },
-    [mesh],
-  )
-
-  useFrame((_state, rawDelta) => {
-    const instanced = ref.current
-    if (!instanced) return
-    const delta = Math.min(rawDelta, 0.05)
-
-    drainBursts((burst) => {
+  function update(rawDt, enabled) {
+    const dt = Math.min(rawDt, 0.05)
+    // Drift smoke straight from the car, while sliding.
+    const car = runtime.car
+    if (enabled && car.drifting && car.grounded && Math.random() < 0.6) {
+      spawn(car.position.x, car.position.y - 0.3, car.position.z, 'smoke', 1.5, 1)
+    }
+    drainBursts((b) => {
       if (!enabled) return
-      const palette = PALETTES[burst.palette] || PALETTES.confetti
-      for (let i = 0; i < burst.count; i += 1) {
-        const index = next.current
-        next.current = (next.current + 1) % POOL
-        const p = pieces[index]
-        p.life = 1.2 + Math.random() * 0.8
-        p.pos.set(burst.x, burst.y, burst.z)
-        const a = Math.random() * Math.PI * 2
-        const speed = burst.speed * (0.5 + Math.random() * 0.7)
-        p.vel.set(Math.cos(a) * speed * 0.6, burst.speed * (0.8 + Math.random() * 0.8), Math.sin(a) * speed * 0.6)
-        p.rot.set(Math.random() * 6, Math.random() * 6, Math.random() * 6)
-        p.spin.set((Math.random() - 0.5) * 14, (Math.random() - 0.5) * 14, (Math.random() - 0.5) * 14)
-        instanced.setColorAt(index, palette[Math.floor(Math.random() * palette.length)])
-      }
-      if (instanced.instanceColor) instanced.instanceColor.needsUpdate = true
+      for (let i = 0; i < (b.count || 12); i += 1) spawn(b.x, b.y, b.z, b.palette || 'confetti', b.speed || 6, 0)
     })
-
-    let alive = false
+    if (!enabled) {
+      mesh.count = 0
+      return
+    }
+    let n = 0
     for (let i = 0; i < POOL; i += 1) {
       const p = pieces[i]
       if (p.life <= 0) continue
-      p.life -= delta
-      if (p.life <= 0) {
-        instanced.setMatrixAt(i, _m.makeScale(0, 0, 0))
-        alive = true
-        continue
-      }
-      alive = true
-      p.vel.y -= GRAVITY * delta
-      p.vel.multiplyScalar(1 - delta * 1.2)
-      p.pos.addScaledVector(p.vel, delta)
-      p.rot.addScaledVector(p.spin, delta)
-      _q.setFromEuler(_e.set(p.rot.x, p.rot.y, p.rot.z))
-      _s.copy(PIECE).multiplyScalar(Math.min(1, p.life * 2))
-      instanced.setMatrixAt(i, _m.compose(p.pos, _q, _s))
+      p.life -= dt
+      p.vel.y -= p.gravity * dt
+      p.vel.multiplyScalar(1 - dt * 0.8)
+      p.pos.addScaledVector(p.vel, dt)
+      const t = p.life / p.max
+      _s.setScalar(p.size * (p.grow ? 1 + (1 - t) * p.grow : Math.min(1, t * 3)))
+      _q.setFromAxisAngle(_axis, p.spin * (1 - t) * 6)
+      _m.compose(p.pos, _q, _s)
+      mesh.setMatrixAt(n, _m)
+      mesh.setColorAt(n, p.color)
+      n += 1
     }
-    // Nothing to draw (or particles off): skip the draw call entirely.
-    instanced.visible = alive
-    if (alive) instanced.instanceMatrix.needsUpdate = true
-  })
+    mesh.count = n
+    mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+  }
 
-  return <primitive ref={ref} object={mesh} />
+  // Disposing frees the GPU copies; three re-uploads them if the canvas comes back.
+  const dispose = () => {
+    geometry.dispose()
+    material.dispose()
+  }
+  return { mesh, update, dispose }
 }
 
-export default Particles
+export default function Particles() {
+  const enabled = useQuality((s) => s.settings.particles)
+  system ||= createSystem()
+  useEffect(() => () => system.dispose(), [])
+  useFrame((_, dt) => system.update(dt, enabled))
+  return <primitive object={system.mesh} />
+}

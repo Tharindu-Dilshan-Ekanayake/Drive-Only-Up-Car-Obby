@@ -1,0 +1,381 @@
+/* Heat Run HUD (HeatHud.jsx). Sizes in reference pixels (--px), floored for phones. */
+
+.heat-hud {
+  left: calc(var(--sa-l) + var(--px) * 24);
+  bottom: calc(var(--sa-b) + var(--px) * 24);
+  gap: calc(var(--px) * 8);
+  color: #ffffff;
+  line-height: 1;
+  z-index: 2;
+}
+/* Touch: the steering pad owns the bottom left - sit top right, under the name tag and left
+   of the altitude card and rail, a little smaller. */
+.hud-root[data-touch='1'] .heat-hud {
+  left: auto;
+  bottom: auto;
+  right: calc(var(--sa-r) + 96px);
+  top: calc(var(--sa-t) + var(--tag-h) + 20px);
+  align-items: flex-end;
+  transform: scale(0.85);
+  transform-origin: top right;
+}
+/* The radio line, the radar and the column of plates. */
+.heat-row {
+  gap: calc(var(--px) * 10);
+}
+.hud-root[data-touch='1'] .heat-row {
+  flex-direction: row-reverse;
+}
+.heat-col {
+  gap: calc(var(--px) * 8);
+}
+.hud-root[data-touch='1'] .heat-col {
+  align-items: flex-end;
+}
+.heat-radio {
+  gap: calc(var(--px) * 8);
+  max-width: max(calc(var(--px) * 560), 260px);
+  padding: max(calc(var(--px) * 6), 3px) max(calc(var(--px) * 12), 6px);
+  border-radius: max(calc(var(--px) * 10), 5px);
+  background: rgba(10, 14, 30, 0.86);
+  border-left: max(calc(var(--px) * 4), 2px) solid #2de2ff;
+}
+.heat-radio-tag {
+  flex: none;
+  -webkit-text-stroke: 0;
+  text-shadow: none;
+  paint-order: normal;
+  font-size: max(calc(var(--px) * 15), 9px);
+  color: #0b1424;
+  background: #2de2ff;
+  padding: 0.15em 0.45em;
+  border-radius: 0.3em;
+  letter-spacing: 0.05em;
+}
+.heat-radio-text {
+  font-size: max(calc(var(--px) * 19), 11px);
+  line-height: 1.15;
+  color: #e9f6ff;
+}
+.heat-radio-in-a {
+  animation: heat-radio-a 0.35s ease-out;
+}
+.heat-radio-in-b {
+  animation: heat-radio-b 0.35s ease-out;
+}
+@keyframes heat-radio-a {
+  from {
+    opacity: 0;
+    transform: translateY(30%);
+  }
+}
+@keyframes heat-radio-b {
+  from {
+    opacity: 0;
+    transform: translateY(30%);
+  }
+}
+.heat-radar {
+  position: relative;
+  flex: none;
+  width: max(calc(var(--px) * 118), 64px);
+  height: max(calc(var(--px) * 118), 64px);
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle, rgba(16, 26, 48, 0.92) 0%, rgba(8, 12, 28, 0.92) 70%);
+  border: max(calc(var(--px) * 3), 2px) solid rgba(120, 160, 220, 0.55);
+  box-shadow: 0 calc(var(--px) * 4) calc(var(--px) * 10) rgba(0, 0, 0, 0.45);
+}
+.heat-radar[data-seen='1'] {
+  border-color: rgba(255, 59, 78, 0.95);
+  box-shadow: 0 0 calc(var(--px) * 16) rgba(255, 59, 78, 0.5), 0 calc(var(--px) * 4) calc(var(--px) * 10) rgba(0, 0, 0, 0.45);
+}
+.heat-radar-ring {
+  position: absolute;
+  inset: 25%;
+  border-radius: 50%;
+  border: 1px solid rgba(140, 180, 240, 0.28);
+}
+.heat-radar-sweep {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, rgba(45, 226, 255, 0.28), rgba(45, 226, 255, 0) 22%);
+  animation: heat-sweep 2.4s linear infinite;
+}
+@keyframes heat-sweep {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.heat-radar-you {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  transform: translate(-50%, -60%);
+  border-left: max(calc(var(--px) * 7), 4px) solid transparent;
+  border-right: max(calc(var(--px) * 7), 4px) solid transparent;
+  border-bottom: max(calc(var(--px) * 13), 7px) solid #ffffff;
+}
+.heat-dot {
+  position: absolute;
+  width: max(calc(var(--px) * 11), 6px);
+  height: max(calc(var(--px) * 11), 6px);
+  margin: max(calc(var(--px) * -5.5), -3px) 0 0 max(calc(var(--px) * -5.5), -3px);
+  border-radius: 50%;
+  background: #ff3b4e;
+  box-shadow: 0 0 calc(var(--px) * 6) rgba(255, 59, 78, 0.9);
+}
+.heat-dot[data-kind='search'] {
+  background: #7a8cff;
+  box-shadow: none;
+  opacity: 0.8;
+}
+.heat-dot[data-kind='block'] {
+  background: #ffc41f;
+  border-radius: 2px;
+  box-shadow: 0 0 calc(var(--px) * 6) rgba(255, 196, 31, 0.9);
+}
+.heat-dot[data-kind='heli'] {
+  width: max(calc(var(--px) * 16), 9px);
+  height: max(calc(var(--px) * 16), 9px);
+  margin: max(calc(var(--px) * -8), -4.5px) 0 0 max(calc(var(--px) * -8), -4.5px);
+  background: transparent;
+  border: max(calc(var(--px) * 3), 2px) solid #2de2ff;
+  box-shadow: 0 0 calc(var(--px) * 6) rgba(45, 226, 255, 0.9);
+}
+.heat-dot[data-kind='car'] {
+  width: max(calc(var(--px) * 7), 4px);
+  height: max(calc(var(--px) * 7), 4px);
+  margin: max(calc(var(--px) * -3.5), -2px) 0 0 max(calc(var(--px) * -3.5), -2px);
+  background: rgba(255, 255, 255, 0.75);
+  box-shadow: none;
+}
+.heat-bounty {
+  gap: calc(var(--px) * 10);
+  padding: max(calc(var(--px) * 5), 3px) max(calc(var(--px) * 14), 7px);
+  border-radius: max(calc(var(--px) * 12), 6px);
+  background: rgba(14, 10, 32, 0.82);
+}
+.heat-bounty-label {
+  font-size: max(calc(var(--px) * 18), 11px);
+  color: #ffd23a;
+}
+.heat-bounty-value {
+  font-size: max(calc(var(--px) * 24), 13px);
+  min-width: 3.2em;
+}
+.heat-banked {
+  font-size: max(calc(var(--px) * 15), 9px);
+  opacity: 0.75;
+}
+.heat-bounty-pop {
+  font-size: max(calc(var(--px) * 16), 10px);
+  color: #3dffb0;
+}
+.heat-bounty-pop[data-lost='1'] {
+  color: #ff5a63;
+}
+.heat-pop-in-a {
+  animation: heat-bpop-a 0.4s cubic-bezier(0.2, 0.9, 0.3, 1.5);
+}
+.heat-pop-in-b {
+  animation: heat-bpop-b 0.4s cubic-bezier(0.2, 0.9, 0.3, 1.5);
+}
+@keyframes heat-bpop-a {
+  from {
+    transform: scale(1.5);
+  }
+}
+@keyframes heat-bpop-b {
+  from {
+    transform: scale(1.5);
+  }
+}
+.heat-evade-label {
+  color: #7ad7ff;
+}
+.heat-evade-fill {
+  background: linear-gradient(90deg, #2de2ff 0%, #3dffb0 100%);
+}
+.heat-evade-time {
+  font-size: max(calc(var(--px) * 18), 11px);
+  min-width: 2.6em;
+}
+.heat-plate {
+  gap: calc(var(--px) * 10);
+  padding: max(calc(var(--px) * 8), 4px) max(calc(var(--px) * 16), 8px);
+  border-radius: max(calc(var(--px) * 16), 8px);
+  background: linear-gradient(180deg, rgba(40, 18, 40, 0.88), rgba(14, 10, 32, 0.9));
+  border: max(calc(var(--px) * 3), 2px) solid rgba(255, 59, 78, 0.85);
+  box-shadow: 0 0 calc(var(--px) * 18) rgba(255, 59, 78, 0.35), 0 calc(var(--px) * 4) calc(var(--px) * 10) rgba(0, 0, 0, 0.45);
+}
+.heat-hud[data-level='5'] .heat-plate,
+.heat-hud[data-level='4'] .heat-plate {
+  animation: heat-siren 0.8s steps(1) infinite;
+}
+.heat-title {
+  font-size: max(calc(var(--px) * 26), 14px);
+  color: #ff5a63;
+  letter-spacing: 0.06em;
+}
+.heat-stars {
+  gap: calc(var(--px) * 3);
+}
+.heat-star {
+  font-size: max(calc(var(--px) * 34), 18px);
+  color: rgba(255, 255, 255, 0.18);
+  transition: color 0.2s, transform 0.2s;
+}
+.heat-star[data-on='1'] {
+  color: #ffd23a;
+  text-shadow: 0 0 calc(var(--px) * 10) rgba(255, 180, 40, 0.8);
+}
+.heat-level {
+  font-size: max(calc(var(--px) * 18), 11px);
+  opacity: 0.85;
+}
+.heat-meter {
+  gap: calc(var(--px) * 10);
+  padding: max(calc(var(--px) * 6), 3px) max(calc(var(--px) * 14), 7px);
+  border-radius: max(calc(var(--px) * 12), 6px);
+  background: rgba(14, 10, 32, 0.82);
+}
+.heat-meter-label {
+  font-size: max(calc(var(--px) * 22), 12px);
+  color: #ffffff;
+}
+.heat-meter[data-hot='1'] .heat-meter-label {
+  color: #ff3b4e;
+  animation: heat-blink 0.25s steps(1) infinite;
+}
+.heat-meter-track {
+  position: relative;
+  overflow: hidden;
+  width: max(calc(var(--px) * 220), 110px);
+  height: max(calc(var(--px) * 16), 8px);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.15);
+}
+.heat-meter-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left center;
+  transform: scaleX(0);
+  background: linear-gradient(90deg, #2a6bff 0%, #b04cff 45%, #ff3b4e 100%);
+}
+.heat-chips {
+  gap: calc(var(--px) * 6);
+}
+.heat-chip {
+  align-items: center;
+  font-size: max(calc(var(--px) * 18), 11px);
+  padding: max(calc(var(--px) * 5), 3px) max(calc(var(--px) * 10), 6px);
+  border-radius: 999px;
+}
+.heat-chip-warn {
+  background: #ffd23a;
+  color: #1b1b1b;
+  -webkit-text-stroke: 0;
+  animation: heat-blink 0.2s steps(1) infinite;
+}
+.heat-chip-box {
+  background: #ff3b4e;
+}
+.heat-chip-emp {
+  background: #18a3c6;
+}
+.heat-chip-slow {
+  background: #ff7ad8;
+}
+.heat-pop-a .heat-plate {
+  animation: heat-pop-a 0.45s cubic-bezier(0.2, 0.9, 0.3, 1.5);
+}
+.heat-pop-b .heat-plate {
+  animation: heat-pop-b 0.45s cubic-bezier(0.2, 0.9, 0.3, 1.5);
+}
+
+/* BUSTED! - the big moment. */
+.heat-bust {
+  z-index: 5;
+  background: radial-gradient(ellipse at center, rgba(20, 0, 10, 0.25) 0%, rgba(20, 0, 10, 0.65) 100%);
+}
+.heat-bust-band {
+  position: absolute;
+  inset: 0;
+  animation: heat-bust-flash 0.3s steps(1) infinite;
+  mix-blend-mode: screen;
+}
+.heat-bust-text {
+  position: relative;
+  font-size: max(calc(var(--px) * 190), 72px);
+  letter-spacing: 0.04em;
+  color: #ffffff;
+  -webkit-text-stroke: 0.07em #14123a;
+  text-shadow: 0 0.06em 0 #ff3b4e, 0 0.1em 0 #14123a, 0 0 0.3em rgba(255, 59, 78, 0.8);
+  animation: heat-bust-glow 0.3s steps(1) infinite;
+  transform: rotate(-4deg);
+}
+@keyframes heat-bust-glow {
+  50% {
+    text-shadow: 0 0.06em 0 #2a6bff, 0 0.1em 0 #14123a, 0 0 0.3em rgba(42, 107, 255, 0.8);
+  }
+}
+.heat-bust-sub {
+  position: relative;
+  margin-top: calc(var(--px) * 18);
+  font-size: max(calc(var(--px) * 34), 16px);
+  color: #ffffff;
+}
+.heat-bust-in-a .heat-bust-text {
+  animation: heat-slam-a 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.4) both, heat-bust-glow 0.3s steps(1) infinite;
+}
+.heat-bust-in-b .heat-bust-text {
+  animation: heat-slam-b 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.4) both, heat-bust-glow 0.3s steps(1) infinite;
+}
+
+@keyframes heat-siren {
+  0% {
+    border-color: rgba(255, 59, 78, 0.95);
+  }
+  50% {
+    border-color: rgba(42, 107, 255, 0.95);
+  }
+}
+@keyframes heat-blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes heat-bust-flash {
+  0% {
+    background: radial-gradient(circle at 0% 50%, rgba(255, 30, 50, 0.45), transparent 55%);
+  }
+  50% {
+    background: radial-gradient(circle at 100% 50%, rgba(40, 90, 255, 0.45), transparent 55%);
+  }
+}
+@keyframes heat-pop-a {
+  from {
+    transform: scale(1.35);
+  }
+}
+@keyframes heat-pop-b {
+  from {
+    transform: scale(1.35);
+  }
+}
+@keyframes heat-slam-a {
+  from {
+    transform: rotate(-4deg) scale(2.6);
+    opacity: 0;
+  }
+}
+@keyframes heat-slam-b {
+  from {
+    transform: rotate(-4deg) scale(2.6);
+    opacity: 0;
+  }
+}
