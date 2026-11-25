@@ -2017,6 +2017,73 @@ html[data-ads='1'] {
   background: rgba(6, 12, 34, 0.7);
   box-shadow: inset 0 4px 6px rgba(0, 0, 0, 0.45);
 }
+/* The two real cars crossing the loading screen's pier: in from off the left edge, out off the right. */
+.load-roll {
+  animation: load-roll var(--dur, 7s) linear var(--delay, 0s) infinite both;
+  transform: translateX(-620px);
+}
+@keyframes load-roll {
+  from {
+    transform: translateX(-620px);
+  }
+  to {
+    transform: translateX(2200px);
+  }
+}
+.load-bob {
+  animation: load-bob 0.36s ease-in-out infinite alternate;
+}
+@keyframes load-bob {
+  to {
+    transform: translateY(-3px);
+  }
+}
+/* Wheels turn about their own centre; the pier's lane line runs backwards under the cars. */
+.load-wheel {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: load-spin 0.42s linear infinite;
+}
+@keyframes load-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.load-dash {
+  animation: load-dash 0.8s linear infinite;
+}
+@keyframes load-dash {
+  to {
+    stroke-dashoffset: -80;
+  }
+}
+/* Upright screens only see the middle third of the scene: the cars cross just that, faster, so one is always in view. */
+@media (orientation: portrait) {
+  .load-roll {
+    animation-name: load-roll-narrow;
+    animation-duration: calc(var(--dur, 7s) * 0.42);
+    animation-delay: calc(var(--delay, 0s) * 0.42);
+  }
+}
+@keyframes load-roll-narrow {
+  from {
+    transform: translateX(80px);
+  }
+  to {
+    transform: translateX(1060px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .load-roll,
+  .load-bob,
+  .load-wheel,
+  .load-dash {
+    animation: none;
+  }
+  .load-roll {
+    transform: translateX(300px);
+  }
+}
 .load-car {
   filter: drop-shadow(0 3px 0 rgba(13, 21, 48, 0.5));
   animation: load-car 0.5s ease-in-out infinite alternate;

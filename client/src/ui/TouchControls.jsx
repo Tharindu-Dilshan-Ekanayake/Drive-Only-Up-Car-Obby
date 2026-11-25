@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react'
 
+import { MAX_SLOTS } from '@shared/balance'
+
 import { ITEMS, requestItem } from '../game/player/items'
 import { runtime } from '../game/runtime'
 import { useGame } from '../store/game'
@@ -187,6 +189,23 @@ function TouchItems() {
           </button>
         )
       })}
+      {slots < MAX_SLOTS && (
+        <button
+          type="button"
+          aria-label="Unlock another item slot"
+          className="touch-btn touch-slot-plus pointer-events-auto relative"
+          style={{ width: 58, height: 58, borderRadius: 16, border: `4px solid ${INK}` }}
+          onClick={() => useGame.getState().togglePanel('store')}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <span className="pp-stroke" style={{ fontSize: 26, lineHeight: 0.9 }}>
+            +
+          </span>
+          <span className="pp-stroke" style={{ fontSize: 10, lineHeight: 1 }}>
+            SLOT
+          </span>
+        </button>
+      )}
     </div>
   )
 }
