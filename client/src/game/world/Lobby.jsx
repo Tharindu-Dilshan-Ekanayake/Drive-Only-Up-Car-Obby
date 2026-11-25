@@ -67,7 +67,7 @@ function lobbySigns(stageId, locked) {
     },
     { text: 'THE FIRST CLIMB', sub: 'PIER ZERO', center: [-24, DECK_Y + 0.66, 22 + 3.3], right: [1, 0, 0], up: [0, 1, 0], width: 3.2, height: 0.8, bg: '#e09a10' },
     // Lettering painted on the boulevard, read driving north.
-    { text: 'UP WE DRIVE', center: [0, DECK_Y + 0.045, 4], right: [1, 0, 0], up: [0, 0, -1], width: 12, height: 3, bg: 'rgba(0,0,0,0)', fg: '#f2f4f7' },
+    { text: 'DRIVE ONLY UP!', center: [0, DECK_Y + 0.045, 4], right: [1, 0, 0], up: [0, 0, -1], width: 12, height: 3, bg: 'rgba(0,0,0,0)', fg: '#f2f4f7' },
     { text: 'START', center: [0, DECK_Y + 0.045, -27], right: [1, 0, 0], up: [0, 0, -1], width: 10, height: 2.5, bg: 'rgba(0,0,0,0)', fg: '#ffc41f' },
   ]
   // The map portal's board, over its arch, facing the lobby (south).
