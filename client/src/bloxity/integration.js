@@ -171,11 +171,15 @@ function installLifecycle(sdk) {
     gameplayStarted = true
     safeCall(game?.gameplayStart?.bind(game))
   }
-  /** Screen ads: 'panel' while a modal panel is open, 'gameplay' otherwise. */
+  /**
+   * Screen ads only while a modal panel is open (the game is paused in a menu then); the game
+   * never asks for them while the player is driving, so nothing covers the road.
+   */
   const sync = (state) => {
     if (!state.playable) return
     start()
-    setScreen(state.panel ? 'panel' : 'gameplay')
+    if (state.panel) setScreen('panel')
+    else hideScreen()
   }
   sync(getGame())
   const unsubscribe = useGame.subscribe((state, prev) => {
